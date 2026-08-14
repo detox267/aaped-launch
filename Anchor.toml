@@ -1,0 +1,26 @@
+[toolchain]
+package_manager = "yarn"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+aaped_launch = "DBc9SEQghiJUj52YPqTKk8R4CMRgagBxi2LU1yBbeMpk"
+
+[programs.mainnet]
+aaped_launch = "DBc9SEQghiJUj52YPqTKk8R4CMRgagBxi2LU1yBbeMpk"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Devnet"
+wallet = "~/.config/solana/id.json"
+
+[programs.devnet]
+aaped_launch = "DBc9SEQghiJUj52YPqTKk8R4CMRgagBxi2LU1yBbeMpk"
+mock_swap = "7QyZeftmo4HQ2Ayub8vhbB1nK6mtprknYNSXW1XjsLts"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
