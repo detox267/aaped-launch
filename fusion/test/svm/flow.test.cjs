@@ -41,7 +41,7 @@ test("real Raydium CPI creates a fixed-tax mint and per-token vaults", () => {
     0n,
   );
 });
-test("real CPMM program converts only this CA vault on the pinned pair", () => {
+test("real CPMM program converts only this CA vault on the pinned pair using the production quote", async () => {
   const t = setup({ raydium: true }),
     l = t.launch(),
     base = l.mint.publicKey,
@@ -107,26 +107,23 @@ test("real CPMM program converts only this CA vault on the pinned pair", () => {
     [c.collect(t.program, t.operator.publicKey, base, [userBase])],
     [t.operator],
   );
-  const amount = t.balance(l.a.baseVault, spl.TOKEN_2022_PROGRAM_ID),
-    minOut = 1n;
-  const swap = sdk.makeSwapCpmmBaseInInstruction(
-    c.CPMM,
-    l.a.launch,
-    keys.authority,
-    t.cpConfig,
-    keys.poolId,
-    l.a.baseVault,
-    l.a.quoteVault,
-    baseFirst ? keys.vaultA : keys.vaultB,
-    baseFirst ? keys.vaultB : keys.vaultA,
-    spl.TOKEN_2022_PROGRAM_ID,
-    spl.TOKEN_PROGRAM_ID,
-    base,
-    quote,
-    keys.observationId,
-    new BN(amount.toString()),
-    new BN(1),
-  );
+  const amount = t.balance(l.a.baseVault, spl.TOKEN_2022_PROGRAM_ID);
+  const { PublicKey } = require("@solana/web3.js");
+  const info = key => {
+    const a = t.get(key), data = Buffer.from(a.data);
+    // Quote fixture only: the actual privileged graduation service is not run.
+    if (key.equals(l.pool)) data[sdk.LaunchpadPool.offsetOf("status")] = 2;
+    return { ...a, owner: new PublicKey(a.programAddress), data };
+  };
+  const rpc = { getAccountInfo: async key => info(key), getMultipleAccountsInfo: async keys => keys.map(info),
+    getEpochInfo: async () => ({ epoch: Number(t.svm.getClock().epoch), absoluteSlot: Number(t.svm.getClock().slot) }) };
+  const quoted = await require("../../worker/quotes.cjs").raydiumQuote(rpc, {
+    state: t.launchState(base), addresses: l.a,
+    baseMint: spl.unpackMint(base, info(base), spl.TOKEN_2022_PROGRAM_ID),
+    quoteMint: spl.unpackMint(quote, info(quote), spl.TOKEN_PROGRAM_ID),
+  }, { platform: t.platform, cpConfig: t.cpConfig }, amount, 100, 0);
+  const minOut = BigInt(quoted.minOut), swap = require("../../worker/common.cjs").decodeInstruction(quoted.swap);
+  assert.equal(quoted.route, "cpmm"); assert(minOut > 1n);
   const ix = c.convert(
     t.program,
     t.operator.publicKey,
@@ -148,7 +145,7 @@ test("real CPMM program converts only this CA vault on the pinned pair", () => {
   wrong.keys[7 + 3].pubkey = l.pool;
   t.send([wrong], [t.operator], false);
   t.send([ix], [t.operator]);
-  assert(t.launchState(base).credited > 0n);
+  assert(t.launchState(base).credited >= minOut);
 });
 test("launch rejects wrong tax, extra platform fees and wrong collector atomically", () => {
   const t = setup({ raydium: true });
