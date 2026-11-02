@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "live": false,
+  "rpcUrl": "https://YOUR_RPC_ENDPOINT",
+  "programId": "REPLACE_WITH_NEW_VERIFIED_PROGRAM_ID",
+  "upgradeAuthority": "5zDozijrnBsdQ4CgDddJhBFDrmuoSya8C2EG15sZEFt6",
+  "admin": "5zDozijrnBsdQ4CgDddJhBFDrmuoSya8C2EG15sZEFt6",
+  "operator": "CtnPVM3vrBZik3HxMZAvhjQpmSYz5HZUAqXvn6az9GQ",
+  "feeWallet": "3mTCqBzGWMkUHqp3Ysepj3oewaMw6ndGQ368gEnxv1uH",
+  "platform": "3gJPDjVbPMM5pSDbWJfmx28QMtp8vaJeUkfneZ25jsdU",
+  "cpConfig": "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2",
+  "releaseCommit": "REPLACE_WITH_VERIFIED_PUBLIC_COMMIT",
+  "binaryPath": "/root/moonz-fusion-release/fusion/target/deploy/moonz_fusion.so",
+  "keyFile": "/root/.config/moonz/reward-collector.json",
+  "journalFile": "/root/.local/share/moonz-fusion/collector.sqlite",
+  "priceApiKey": "REPLACE_LOCALLY_WITH_DEDICATED_JUPITER_KEY",
+  "maxSwapRaw": "1000000000000",
+  "minSolLamports": "5000000",
+  "slippageBps": 100,
+  "priorityMicroLamports": 1000,
+  "maxFeeLamports": 25000,
+  "canaryMints": []
+}

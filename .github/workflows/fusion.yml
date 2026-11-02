@@ -1,0 +1,58 @@
+name: Fusion program review
+on:
+  pull_request:
+    paths: ['fusion/**', '.github/workflows/fusion.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: fusion
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.22.1'
+          cache: npm
+          cache-dependency-path: fusion/package-lock.json
+      - name: Rust checks
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+          cargo +1.89.0 fmt --check
+          cargo +1.89.0 clippy --all-targets --locked -- -D warnings
+          cargo +1.89.0 test --locked
+      - name: Install pinned verifier
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://github.com/solana-foundation/solana-verifiable-build/releases/download/v0.5.2/solana-verify-0.5.2-linux \
+            --output "$RUNNER_TEMP/solana-verify"
+          echo 'b9d5ccce9634dc14269cab3e7a58649bc141b3306e7735a94478c936341f211f  solana-verify' > "$RUNNER_TEMP/verifier.sha256"
+          (cd "$RUNNER_TEMP" && sha256sum --check verifier.sha256)
+          chmod +x "$RUNNER_TEMP/solana-verify"
+      - name: Build reproducible Docker artifact
+        run: |
+          "$RUNNER_TEMP/solana-verify" build .
+          test -s target/deploy/moonz_fusion.so
+          sha256sum target/deploy/moonz_fusion.so > release-binary.sha256
+      - name: Test client and actual SBF artifact
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+          node ops/fetch-raydium-fixture.cjs
+          npm run test:svm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fusion-review-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            fusion/target/deploy/moonz_fusion.so
+            fusion/release-binary.sha256
+          if-no-files-found: error
+          retention-days: 30
