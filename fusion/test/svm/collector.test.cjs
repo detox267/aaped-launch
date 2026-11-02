@@ -1,12 +1,12 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict");
-const { Transaction, ComputeBudgetProgram, PublicKey } = require("@solana/web3.js");
+const { Transaction, TransactionInstruction, ComputeBudgetProgram, PublicKey } = require("@solana/web3.js");
 const { getTransactionDecoder } = require("@solana/kit");
 const { FailedTransactionMetadata } = require("litesvm");
-const { setup, spl, c } = require("./helpers.cjs");
+const { setup, spl, c, sdk, BN } = require("./helpers.cjs");
 const { Collector, CollectorStore, INTERVAL_MS } = require("../../worker/collector.cjs");
 
-test("five-minute engine runs real tax collection and paired sale, preserving separate net pots", async () => {
+test("five-minute engine accumulates small tax then executes qualifying paired sales with separate net pots", async () => {
   const t = setup({ raydium: true }), a = t.launch(), b = t.launch();
   t.send([a.instruction], [t.admin, a.mint]);
   t.send([b.instruction], [t.admin, b.mint]);
@@ -21,13 +21,36 @@ test("five-minute engine runs real tax collection and paired sale, preserving se
     ready: async () => {},
     snapshot: async mint => ({ sources: [sources.get(mint).toBase58()], mintWithheld: "0" }),
     baseBalance: async mint => t.balance(launches.get(mint).a.baseVault, spl.TOKEN_2022_PROGRAM_ID),
+    quoteSale: async request => {
+      const l = launches.get(request.mint), clock = t.svm.getClock();
+      const pool = sdk.LaunchpadPool.decode(Buffer.from(t.get(l.pool).data));
+      const config = sdk.LaunchpadConfig.decode(Buffer.from(t.get(l.global).data));
+      const platform = sdk.PlatformConfig.decode(Buffer.from(t.get(t.platform).data));
+      const mintAccount = t.get(l.mint.publicKey);
+      const mint = spl.unpackMint(l.mint.publicKey, { ...mintAccount,
+        owner: spl.TOKEN_2022_PROGRAM_ID, data: Buffer.from(mintAccount.data) }, spl.TOKEN_2022_PROGRAM_ID);
+      const fees = spl.getTransferFeeConfig(mint);
+      const active = clock.epoch < fees.newerTransferFee.epoch ? fees.olderTransferFee : fees.newerTransferFee;
+      const result = sdk.Curve.sellExactIn({ poolInfo: pool, curveType: config.curveType,
+        protocolFeeRate: config.tradeFeeRate, platformFeeRate: platform.feeRate,
+        creatorFeeRate: platform.creatorFeeRate, shareFeeRate: new BN(0),
+        transferFeeConfigA: { ...fees, olderTransferFee: active, newerTransferFee: active },
+        slot: Number(clock.slot), amountA: new BN(request.amount) });
+      const minOut = BigInt(result.amountB.toString()) * 9900n / 10000n;
+      // Deterministic $200/SOL test price, NOT a live USD oracle. Output quote uses
+      // the actual local Raydium reserves, transfer tax and 1% slippage allowance.
+      return { mint: request.mint, amount: request.amount, quoteMint: l.quote.toBase58(),
+        minOut: String(minOut), minOutUsdMicros: String(minOut * 200_000_000n / 1_000_000_000n),
+        quotedAt: now, priceAt: now };
+    },
     prepare: async request => {
       const l = launches.get(request.mint);
       const instruction = request.kind === "collect"
         ? c.collect(t.program, t.operator.publicKey, l.mint.publicKey, request.sources.map(s => new PublicKey(s)))
-        : t.convert(l, BigInt(request.amount));
+        : t.convert(l, BigInt(request.amount), BigInt(request.quote.minOut));
       const tx = new Transaction({ feePayer: t.operator.publicKey, recentBlockhash: t.svm.latestBlockhash() })
-        .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), instruction);
+        .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+          new TransactionInstruction({ programId: sdk.MEMO_PROGRAM_ID, keys: [], data: Buffer.from(request.id) }), instruction);
       tx.sign(t.operator);
       return { wire: tx.serialize().toString("base64"), signature: tx.signature.toString("base64") };
     },
@@ -45,7 +68,17 @@ test("five-minute engine runs real tax collection and paired sale, preserving se
   try {
     now = INTERVAL_MS - 1; await worker.tick(mint); assert.equal(executed.size, 0);
     now = INTERVAL_MS;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 20; i++) {
+      await worker.tick(mint);
+      if (store.get(mint).phase === "idle") break;
+    }
+    assert.equal(t.launchState(a.mint.publicKey).credited, 0n);
+    assert(t.balance(a.a.baseVault, spl.TOKEN_2022_PROGRAM_ID) > 0n);
+    assert.equal(store.get(mint).outcome, "accumulating");
+    assert(store.receipts().every(r => r.operation.kind === "collect"));
+    t.buy(a, 50_000_000_000n);
+    now = INTERVAL_MS * 2;
+    for (let i = 0; i < 200; i++) {
       await worker.tick(mint);
       if (store.get(mint).phase === "idle") break;
     }
@@ -53,7 +86,8 @@ test("five-minute engine runs real tax collection and paired sale, preserving se
     assert(executed.size >= 2);
     const state = t.launchState(a.mint.publicKey);
     assert(state.credited > 0n);
-    assert.equal(t.balance(a.a.baseVault, spl.TOKEN_2022_PROGRAM_ID), 0n);
+    assert(store.receipts().filter(r => r.operation.kind === "sell")
+      .every(r => BigInt(r.operation.quote.minOutUsdMicros) >= 30_000_000n));
     assert.equal(t.balance(a.a.quoteVault), state.credited);
     assert.equal(state.platformAvailable, state.credited / 4n);
     assert.equal(state.holderAvailable, state.credited - state.platformAvailable);
@@ -61,7 +95,7 @@ test("five-minute engine runs real tax collection and paired sale, preserving se
     assert.equal(t.balance(b.a.baseVault, spl.TOKEN_2022_PROGRAM_ID), 0n);
     assert.equal(state.paidHolders, 0n, "collection timer must not force holder payouts");
     assert.equal(state.paidPlatform, 0n);
-    const count = executed.size; now = INTERVAL_MS * 2 - 1; await worker.tick(mint);
+    const count = executed.size; now = INTERVAL_MS * 3 - 1; await worker.tick(mint);
     assert.equal(executed.size, count);
   } finally { store.close(); }
 });

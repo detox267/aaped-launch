@@ -3,8 +3,22 @@ const { DatabaseSync } = require("node:sqlite");
 
 // Wall-clock collection slots. Payout thresholds do not control this timer.
 const INTERVAL_MS = 300_000;
+const MIN_SALE_USD_MICROS = 30_000_000n;
+const MAX_VALUATION_AGE_MS = 30_000;
 const nextSlot = (now) => (Math.floor(now / INTERVAL_MS) + 1) * INTERVAL_MS;
 const encode = (value) => JSON.stringify(value);
+
+function validateSaleQuote(quote, request, now) {
+  const raw = value => typeof value === "string" && /^(0|[1-9]\d*)$/.test(value);
+  const fresh = value => Number.isSafeInteger(value) && value >= 0 && value <= now
+    && now - value <= MAX_VALUATION_AGE_MS;
+  if (!quote || quote.mint !== request.mint || quote.amount !== request.amount
+    || typeof quote.quoteMint !== "string" || !quote.quoteMint
+    || !raw(quote.minOut) || BigInt(quote.minOut) <= 0n
+    || !raw(quote.minOutUsdMicros) || !fresh(quote.quotedAt) || !fresh(quote.priceAt))
+    throw new Error("Missing, stale or mismatched sale valuation");
+  return BigInt(quote.minOutUsdMicros);
+}
 
 class CollectorStore {
   constructor(filename, program) {
@@ -130,7 +144,8 @@ class Collector {
       if (state.lastSlot !== null && slot <= state.lastSlot) return;
       // Coalesce missed slots into one current cycle; never queue a burst of old sells.
       state = { ...state, cycle: state.cycle + 1, phase: "snapshot", lastSlot: slot,
-        startedAt: now, nextDueAt: nextSlot(now), retryAt: 0, issue: null };
+        startedAt: now, nextDueAt: nextSlot(now), retryAt: 0, issue: null,
+        outcome: null, saleValuation: null };
       this.store.save(state);
     }
     await this.adapter.ready();
@@ -157,21 +172,38 @@ class Collector {
       this.store.save(state);
     }
     if (state.phase === "sell" && BigInt(state.remaining) === 0n) {
-      state.phase = "idle";
-      state.completedAt = this.clock();
-      state.batches = [];
-      state.issue = null;
-      this.store.save(state);
+      this.finishCycle(state, "complete");
       return;
     }
     const request = state.phase === "collect"
       ? { kind: "collect", sources: state.batches[state.batch], ordinal: state.batch }
       : { kind: "sell", amount: String(BigInt(state.remaining) < this.maxSwapRaw
           ? BigInt(state.remaining) : this.maxSwapRaw), ordinal: state.sale };
-    const id = `${mint}/${state.cycle}/${request.kind}/${request.ordinal}`;
-    const prepared = await this.adapter.prepare({ ...request, mint, id, minContextSlot: state.lastSettledSlot });
+    request.mint = mint;
+    request.id = `${mint}/${state.cycle}/${request.kind}/${request.ordinal}`;
+    request.minContextSlot = state.lastSettledSlot;
+    if (request.kind === "sell") {
+      let value;
+      try {
+        request.quote = await this.adapter.quoteSale(request);
+        value = validateSaleQuote(request.quote, request, this.clock());
+      } catch {
+        this.finishCycle(state, "valuation_unavailable", "Sale held: a fresh paired-asset USD quote is unavailable");
+        return;
+      }
+      state.saleValuation = request.quote;
+      if (value < MIN_SALE_USD_MICROS) {
+        this.finishCycle(state, BigInt(request.amount) < BigInt(state.remaining)
+          ? "swap_cap_below_sale_minimum" : "accumulating");
+        return;
+      }
+    }
+    const prepared = await this.adapter.prepare(request);
     if (!prepared?.wire || !prepared.signature) throw new Error("Missing signed transaction");
-    const operation = { ...prepared, ...request, mint, id };
+    // Revalidate after asynchronous simulation/signing; never save a stale new sale.
+    if (request.kind === "sell" && validateSaleQuote(request.quote, request, this.clock()) < MIN_SALE_USD_MICROS)
+      throw new Error("Sale value fell below the minimum during preparation");
+    const operation = { ...prepared, ...request };
     state.pending = operation;
     if (request.kind === "sell") state.sale++;
     // Commit signed bytes before any call capable of broadcasting them.
@@ -179,6 +211,17 @@ class Collector {
     await this.adapter.ready();
     if (this.enabled) await this.adapter.broadcast(operation);
   }
+  finishCycle(state, outcome, issue = null) {
+    state.phase = "idle";
+    state.completedAt = this.clock();
+    state.batches = [];
+    state.outcome = outcome;
+    state.issue = issue;
+    state.retryAt = 0;
+    // Unsold raw balance stays in this CA's on-chain vault for the next cycle.
+    this.store.save(state);
+  }
 }
 
-module.exports = { Collector, CollectorStore, INTERVAL_MS, nextSlot };
+module.exports = { Collector, CollectorStore, INTERVAL_MS, nextSlot,
+  MIN_SALE_USD_MICROS, MAX_VALUATION_AGE_MS };

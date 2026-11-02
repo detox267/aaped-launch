@@ -14,7 +14,7 @@ Standalone native Solana program and CommonJS client for per-token launch/reward
 
 The client exports instruction builders, PDA derivations, state decoders and domain-separated Merkle trees. Integers are BigInt/decimal strings. See `test/svm/flow.test.cjs` for launch/collection/conversion/payout examples and `SECURITY.md` for trust boundaries.
 
-The [five-minute collection engine](worker/README.md) schedules each CA independently at 300-second boundaries, journals signed operations before submission, and resumes pending work across restarts. Collection and capped paired-asset sales complete within the same cycle; holder payout thresholds remain separate. The engine is disabled by default. Its production RPC/verification/quote/receipt adapter and daemon integration are still required; the supplied executable adapter is test-only LiteSVM code.
+The [five-minute collection engine](worker/README.md) schedules each CA independently at 300-second boundaries, journals signed operations before submission, and resumes pending work across restarts. Collection accumulates in each CA's vault; each capped sale requires at least **US$30** of fresh, slippage-protected paired-asset quote value before the platform split. Smaller balances/remainders wait for a later cycle, while stale/missing prices block selling without blocking future collection. Holder payout thresholds remain separate. The engine is disabled by default. Its production RPC/verification/quote/receipt adapter and daemon integration are still required; the supplied executable adapter is test-only LiteSVM code with a fixed test USD price.
 
 ## Local validation
 

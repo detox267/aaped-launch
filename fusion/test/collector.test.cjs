@@ -16,6 +16,11 @@ function fixture(t, options = {}) {
       return { sources: options.sources || [mint + "/tax"], mintWithheld: "0" };
     },
     baseBalance: async (mint, slot) => { calls.push(["balance", mint, slot]); return vault.get(mint) || 0n; },
+    quoteSale: async request => ({
+      mint: request.mint, amount: request.amount, quoteMint: "paired-asset",
+      minOut: request.amount, minOutUsdMicros: String(BigInt(request.amount) * 10_000_000n),
+      quotedAt: now, priceAt: now,
+    }),
     prepare: async request => {
       calls.push(["prepare", request]);
       return { wire: JSON.stringify(request), signature: String(++signature) };
@@ -31,7 +36,7 @@ function fixture(t, options = {}) {
     },
     reconcile: async op => receipts.get(op.signature) || { status: "pending", rebroadcast: true },
   };
-  const make = () => new Collector({ store, adapter, maxSwapRaw: 10n, enabled: true, clock: () => now });
+  const make = () => new Collector({ store, adapter, maxSwapRaw: options.maxSwapRaw || 10n, enabled: true, clock: () => now });
   let worker = make();
   t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return {
@@ -146,4 +151,83 @@ test("disabled, unready and concurrent ticks cannot create overlapping sends", a
   assert.equal(f.sent.size, 1);
   assert.equal(f.calls.filter(c => c[0] === "prepare").length, 1);
   assert.throws(() => new CollectorStore(f.file, "wrong-program"), /another program/);
+});
+
+test("tax accumulates across five-minute cycles and restart until its own sale clears $30", async t => {
+  const f = fixture(t, { maxSwapRaw: 100n }); f.worker.register("A"); f.worker.register("B");
+  const quote = f.adapter.quoteSale;
+  f.adapter.quoteSale = async request => ({ ...await quote(request), minOutUsdMicros: String(BigInt(request.amount) * 1_000_000n) });
+  f.time(INTERVAL_MS); await f.drain("A"); await f.drain("B");
+  assert.equal(f.store.get("A").outcome, "accumulating");
+  assert.equal(f.vault.get("A"), 25n); assert.equal(f.vault.get("B"), 25n);
+  assert(f.store.receipts().every(r => r.operation.kind === "collect"), "same pair must not pool CA values");
+  f.restart(); f.time(INTERVAL_MS * 2); await f.drain("A");
+  assert.equal(f.vault.get("A"), 0n); assert.equal(f.vault.get("B"), 25n);
+  const sale = f.store.receipts().find(r => r.operation.kind === "sell").operation;
+  assert.equal(sale.amount, "50"); assert.equal(sale.quote.minOutUsdMicros, "50000000");
+});
+
+test("$29.999999 waits, exactly $30 sells before the holder/platform split", async t => {
+  const f = fixture(t, { sources: [], maxSwapRaw: 100n }); f.worker.register("A"); f.vault.set("A", 10n);
+  const quote = f.adapter.quoteSale;
+  let value = "29999999";
+  f.adapter.quoteSale = async request => ({ ...await quote(request), minOutUsdMicros: value });
+  f.time(INTERVAL_MS); await f.drain("A"); assert.equal(f.sent.size, 0);
+  value = "30000000"; f.time(INTERVAL_MS * 2); await f.drain("A");
+  assert.equal(f.sent.size, 1); assert.equal(f.vault.get("A"), 0n);
+});
+
+test("a small remainder waits for accumulation, and a raw swap cap cannot bypass $30", async t => {
+  const f = fixture(t, { sources: [], maxSwapRaw: 30n }); f.worker.register("A"); f.vault.set("A", 50n);
+  const quote = f.adapter.quoteSale;
+  f.adapter.quoteSale = async request => ({ ...await quote(request), minOutUsdMicros: String(BigInt(request.amount) * 1_000_000n) });
+  f.time(INTERVAL_MS); await f.drain("A");
+  assert.equal(f.sent.size, 1); assert.equal(f.vault.get("A"), 20n);
+  assert.equal(f.store.get("A").outcome, "accumulating");
+  f.vault.set("A", 100n); f.worker.maxSwapRaw = 20n; f.time(INTERVAL_MS * 2); await f.drain("A");
+  assert.equal(f.sent.size, 1);
+  assert.equal(f.store.get("A").outcome, "swap_cap_below_sale_minimum");
+});
+
+test("stale, missing, future, mismatched or malformed valuation never sells and collection continues", async t => {
+  const f = fixture(t, { maxSwapRaw: 10_000n }); f.worker.register("A");
+  const quote = f.adapter.quoteSale;
+  const bad = [
+    q => ({ ...q, quotedAt: q.quotedAt - 30_001 }),
+    q => ({ ...q, priceAt: q.priceAt - 30_001 }),
+    q => ({ ...q, priceAt: q.priceAt + 1 }),
+    q => ({ ...q, mint: "B" }), q => ({ ...q, amount: "1" }),
+    q => ({ ...q, minOutUsdMicros: 30_000_000 }), q => ({ ...q, minOut: "0" }),
+    q => ({ ...q, minOutUsdMicros: "NaN" }), () => null,
+    () => { throw new Error("price feed offline"); },
+  ];
+  for (let i = 0; i < bad.length; i++) {
+    f.adapter.quoteSale = async request => bad[i](await quote(request));
+    f.time((i + 1) * INTERVAL_MS); await f.drain("A");
+    assert.equal(f.store.get("A").outcome, "valuation_unavailable");
+    assert.equal(f.vault.get("A"), BigInt(i + 1) * 25n);
+  }
+  assert(f.store.receipts().every(r => r.operation.kind === "collect"));
+});
+
+test("each new chunk gets a fresh value check when prices fall, while pending signatures stay fixed", async t => {
+  const f = fixture(t, { sources: [], maxSwapRaw: 30n }); f.worker.register("A"); f.vault.set("A", 60n);
+  const quote = f.adapter.quoteSale;
+  let valuations = 0;
+  f.adapter.quoteSale = async request => ({ ...await quote(request), minOutUsdMicros: ++valuations === 1 ? "30000000" : "29000000" });
+  f.time(INTERVAL_MS); await f.worker.tick("A");
+  const first = f.store.get("A").pending.signature;
+  f.restart(); await f.drain("A");
+  assert.equal(f.sent.size, 1); assert.equal(f.vault.get("A"), 30n);
+  assert.equal(f.store.receipts()[0].operation.signature, first);
+  assert.equal(valuations, 2);
+});
+
+test("a quote that ages during preparation cannot be journalled or broadcast", async t => {
+  const f = fixture(t, { sources: [] }); f.worker.register("A"); f.vault.set("A", 10n);
+  const prepare = f.adapter.prepare;
+  f.adapter.prepare = async request => { const result = await prepare(request); f.time(INTERVAL_MS + 30_001); return result; };
+  f.time(INTERVAL_MS); await f.worker.tick("A");
+  assert.equal(f.sent.size, 0); assert.equal(f.store.get("A").pending, null);
+  assert.equal(f.vault.get("A"), 10n);
 });
