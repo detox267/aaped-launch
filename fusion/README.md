@@ -28,6 +28,8 @@ The fixture fetcher performs only finalized public RPC reads. It downloads deplo
 
 The current backend at `0b8606ba8a959f95dcbddb6a4612e16b648f8154` remains unchanged. Its 235 tests passed in the recovery review. Its shared-signer worker is **not** a drop-in PDA worker. `ops/check-vps-signers.cjs` can read that backend's configuration on the VPS and report only signer-match/permission flags and public balances; it creates no keys and sends nothing. Tier/eligibility decisions can remain off chain, but payout journal/receipt reconciliation must use these instruction builders and on-chain net budgets. Do not apply another 25% split. Existing buyback/burn and creator-prize features need explicit adapters or subsequent program instructions; this v1 exposes holder payouts and payments to the configured fee wallet only.
 
+The VPS signer check emits `diagnosticVersion: 2` and named step results. It reads local key identities before contacting the configured RPC, retains those results if a network call fails, and checks each wallet balance independently after confirming mainnet. Only allowlisted error codes/HTTP statuses are printed; exception messages, RPC URLs, key paths and credentials are never included. It reads the backend's `.env` file, not PM2's inherited environment, and reports that source explicitly. Successful diagnostic checks are not a deployment/activation readiness decision.
+
 ## Verified, upgradeable release
 
 The review workflow uses checksum-pinned `solana-verify 0.5.2`, builds in Docker, and runs the SBF tests against that artifact. It has read-only repository permissions and cannot deploy or activate anything. Its artifact becomes a release candidate only after that workflow passes; it is not on-chain verification.
