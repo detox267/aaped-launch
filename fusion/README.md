@@ -14,9 +14,11 @@ Standalone native Solana program and CommonJS client for per-token launch/reward
 
 The client exports instruction builders, PDA derivations, state decoders and domain-separated Merkle trees. Integers are BigInt/decimal strings. See `test/svm/flow.test.cjs` for launch/collection/conversion/payout examples and `SECURITY.md` for trust boundaries.
 
+The [five-minute collection engine](worker/README.md) schedules each CA independently at 300-second boundaries, journals signed operations before submission, and resumes pending work across restarts. Collection and capped paired-asset sales complete within the same cycle; holder payout thresholds remain separate. The engine is disabled by default. Its production RPC/verification/quote/receipt adapter and daemon integration are still required; the supplied executable adapter is test-only LiteSVM code.
+
 ## Local validation
 
-Prerequisites: Node 20+, Rust 1.89.0 (fmt/clippy), Agave **2.3.13**, platform-tools **v1.48**. Cargo/npm lockfiles are committed. Some transitive dependencies are deliberately pinned in Cargo.lock for the SBF compiler; do not blindly refresh it.
+Prerequisites: Node **24.22.1** (including `node:sqlite`), Rust 1.89.0 (fmt/clippy), Agave **2.3.13**, platform-tools **v1.48**. Cargo/npm lockfiles are committed. Some transitive dependencies are deliberately pinned in Cargo.lock for the SBF compiler; do not blindly refresh it.
 
 ```bash
 bash ops/test-local.sh
