@@ -32,7 +32,7 @@ The review workflow uses checksum-pinned `solana-verify 0.5.2`, builds in Docker
 
 1. Review and pin the public commit. Build it using `solana-verify` with Docker; the workspace metadata selects Agave 2.3.13. From this directory:
    ```bash
-   solana-verify build . --library-name moonz_fusion -- --locked
+   solana-verify build .
    ```
    The Docker output is the release artifact. Re-run all SBF tests against it. A locally compiled ELF is a development artifact until reproduced by this workflow.
 2. Run `node ops/budget.cjs target/deploy/moonz_fusion.so` against that artifact. The JSON separates permanent rent from conservative temporary-buffer rent. Optional second argument sets program capacity in bytes. Transaction fees, verification metadata and operator working balance are separate. Create the deployment keypair only on the VPS, outside Git, after the amount and authority are reviewed. Never share it.
@@ -44,7 +44,7 @@ The review workflow uses checksum-pinned `solana-verify 0.5.2`, builds in Docker
      --commit-hash "$FUSION_RELEASE_COMMIT" \
      --mount-path fusion --library-name moonz_fusion \
      --keypair "$FUSION_UPGRADE_KEYPAIR" \
-     https://github.com/detox267/aaped-launch -- --locked
+     https://github.com/detox267/aaped-launch
    solana-verify remote submit-job --program-id "$FUSION_PROGRAM_ID" \
      --uploader "$FUSION_UPGRADE_AUTHORITY"
    node ops/check-verification.cjs "$FUSION_PROGRAM_ID" \

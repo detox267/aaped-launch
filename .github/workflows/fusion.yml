@@ -39,7 +39,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/solana-verify"
       - name: Build reproducible Docker artifact
         run: |
-          "$RUNNER_TEMP/solana-verify" build . --library-name moonz_fusion -- --locked
+          "$RUNNER_TEMP/solana-verify" build .
           test -s target/deploy/moonz_fusion.so
           sha256sum target/deploy/moonz_fusion.so > release-binary.sha256
       - name: Test client and actual SBF artifact
