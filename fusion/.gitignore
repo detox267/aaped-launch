@@ -1,0 +1,7 @@
+/target/
+/node_modules/
+*-keypair.json
+.env
+/test/fixtures/*.so
+/test/fixtures/accounts.json
+/release-binary.sha256
