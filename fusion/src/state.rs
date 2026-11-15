@@ -11,6 +11,9 @@ pub const CONFIG_SEED: &[u8] = b"config";
 pub const AUTH_SEED: &[u8] = b"tax-authority";
 pub const LAUNCH_SEED: &[u8] = b"launch";
 pub const MAX_LEAVES: u32 = 1024;
+// A bounded SOL operating float, funded exclusively from the platform share.
+pub const MAX_DISTRIBUTION_TOPUP: u64 = 50_000_000;
+pub const MAX_DISTRIBUTION_WALLET: u64 = 100_000_000;
 pub fn on_curve(key: &Pubkey) -> bool {
     key != &Pubkey::default()
         && solana_curve25519::edwards::validate_edwards(
@@ -231,6 +234,9 @@ pub enum FusionInstruction {
         proof: Vec<[u8; 32]>,
     },
     CloseMoonzRound,
+    FundDistributionFees {
+        amount: u64,
+    },
 }
 
 pub fn read<T: BorshDeserialize>(account: &AccountInfo, owner: &Pubkey, len: usize) -> Result<T> {

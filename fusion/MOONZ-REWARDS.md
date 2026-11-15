@@ -27,6 +27,7 @@ New append-only instruction tags:
 | 14 | OpenMoonzRound | Reserve MOONZ against a reviewed Merkle root |
 | 15 | PayMoonz | Exact MOONZ payout with bitmap replay protection |
 | 16 | CloseMoonzRound | Return expired unpaid MOONZ to the same CA |
+| 17 | FundDistributionFees | Fund operator SOL from the platform share only |
 
 Use `client/rewards.cjs` for all new builders, decoding and proofs. Merkle leaves bind the **rewards PDA**, so a legacy launch-domain proof or another CA's proof cannot authorize payment. State/program IDs and canonical vaults are checked on chain.
 
@@ -42,6 +43,17 @@ The planner supports a pair matching MOONZ's current market quote, or MOONZ itse
 
 ## Activation work still required
 
-The current signed-journal runner remains **collection and first-sale only**. MOONZ purchase and holder/platform payout submissions must be wired to the backend's durable prepare-before-send journal, finalized receipts, tier progression and reviewed holder snapshots. This release does not automatically enable those operations. Persist exact signed bytes before submission, never re-sign an ambiguous transaction, revalidate quotes after simulation, and credit only finalized raw vault movements. ATA initialization rent comes from the operator's SOL and must be included in its debit/reserve checks.
+The current signed-journal runner remains **collection and first-sale only**. The new platform-funded distribution sender implements prepare-before-send journaling and finalized fee/payout receipts, but must still be called from the backend's tier progression and reviewed holder-snapshot flow. MOONZ purchase submissions and platform-profit withdrawals still need their release integration. This release does not automatically enable those operations. Persist exact signed bytes before submission, never re-sign an ambiguous transaction, revalidate quotes after simulation, and credit only finalized raw vault movements. ATA initialization rent comes from the operator's SOL and must be included in its debit/reserve checks.
 
 The live backend, launch website binding, new program deployment, public source verification and capped canary remain prerequisites. Source tests are not an independent audit or proof of mainnet readiness. Keep the release draft and live flags disabled until those concrete integration checks pass.
+
+
+## Distribution costs come out of the platform's 25%
+
+Holder amounts are never reduced for the SOL network/priority fee used to distribute them. The fee payer is the platform operator. `FundDistributionFees` unwraps a bounded part of a SOL-paired CA's **platform_available**, credits SOL only to the configured operator, and increases `paid_platform`. It does not debit `holder_available`, the MOONZ reward balance, a round's remaining allocation, or any recipient wallet. Maximum top-up is 0.05 SOL; the operator balance after funding is bounded to 0.1 SOL. Paused, unauthorized, oversized and underfunded requests fail atomically.
+
+`worker/distribution-fees.cjs` provides `DistributionFeeStore` and `PlatformDistributionSender` for the backend. It accepts only funding, opening a MOONZ round, exact MOONZ payouts and closing a round. The sender uses the existing verified `RpcAdapter`, an owner-only durable journal, a platform fee reservation before signing/broadcast, and exact finalized transaction receipts. `meta.fee` includes base and priority fees. Even a finalized failed send is a platform expense; it never reduces a holder's MOONZ allocation. An ambiguous or expired signature retains its reserved fee pending archival reconciliation. Never erase that journal or replace an ambiguous operation with a new signature.
+
+The reserve is platform-wide; a verified SOL top-up from one CA's 25% can sponsor distributions for other CAs. Funding provenance and each expense's CA are recorded. This does not pool holder balances. Direct SOL deposits to the operator wallet are not automatically treated as collected platform revenue. Initial operator SOL is platform startup capital: the first funding transaction needs enough SOL to pay its fee and temporary account rent before reimbursement. Temporary rent is returned, not deducted from holders. The sender skips creation of holder ATAs; the existing missing-ATA rollover rule remains in force.
+
+Only SOL-paired platform proceeds have an automatic on-chain funding instruction in this release. Other platform assets require separately reviewed conversion into SOL, or an already-funded shared platform reserve. If reserve or wallet balance is insufficient, distribution waits; there is no holder-funded fallback. The integration must replenish/reserve gas before sweeping platform profits. Funding the reserve is an allocation of platform funds, not a holder distribution or an additional revenue credit. Ordinary market trading fees in MOONZ conversion quotes are separate from these distribution network fees.

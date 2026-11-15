@@ -305,6 +305,29 @@ const payPlatform = (
     10,
     u64(amount),
   );
+// Fund the operator's SOL float using only this CA's platform budget.
+const MAX_DISTRIBUTION_TOPUP = 50_000_000n;
+const MAX_DISTRIBUTION_WALLET = 100_000_000n;
+function fundDistributionFees(program, operator, base, amount) {
+  u64(amount);
+  if (BigInt(amount) === 0n || BigInt(amount) > MAX_DISTRIBUTION_TOPUP)
+    throw new Error(
+      "Distribution top-up must be between 1 lamport and 0.05 SOL",
+    );
+  return ix(
+    program,
+    paymentKeys(
+      program,
+      operator,
+      base,
+      spl.NATIVE_MINT,
+      spl.TOKEN_PROGRAM_ID,
+      operator,
+    ),
+    17,
+    u64(amount),
+  );
+}
 function creditDonation(program, operator, base, quote, quoteProgram) {
   const a = addresses(program, base, quote, quoteProgram);
   return ix(
@@ -336,7 +359,13 @@ const parent = (a, b) =>
     Buffer.from("MOONZ_FUSION_NODE_V1"),
     ...(Buffer.compare(a, b) <= 0 ? [a, b] : [b, a]),
   );
-function merkleRound(program, base, round, payments, domainAccount = addresses(program, base).launch) {
+function merkleRound(
+  program,
+  base,
+  round,
+  payments,
+  domainAccount = addresses(program, base).launch,
+) {
   if (!payments.length || payments.length > 1024)
     throw new Error("Split into rounds of at most 1024 recipients");
   const launch = pk(domainAccount),
@@ -458,6 +487,9 @@ module.exports = {
   pay,
   closeRound,
   payPlatform,
+  fundDistributionFees,
+  MAX_DISTRIBUTION_TOPUP,
+  MAX_DISTRIBUTION_WALLET,
   creditDonation,
   merkleRound,
   leaf,

@@ -347,6 +347,33 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
             s.close_round(now()?)?;
             write(&a[0], &s)
         }
+        FusionInstruction::FundDistributionFees { amount } => {
+            count(a, 10)?;
+            let cfg = config(program, &a[1])?;
+            operator(&a[0], &cfg)?;
+            require(*a[5].key == cfg.operator, Error::Unauthorized)?;
+            require(
+                amount > 0
+                    && amount <= MAX_DISTRIBUTION_TOPUP
+                    && add(a[0].lamports(), amount)? <= MAX_DISTRIBUTION_WALLET,
+                Error::InvalidAmount,
+            )?;
+            let mut s = launch(program, &a[2])?;
+            require(
+                s.quote == token::WSOL && s.quote_program == token::TOKEN,
+                Error::UnsupportedQuote,
+            )?;
+            let obligations = s.obligations()?;
+            require(
+                token::vault(&a[4], &s.quote, a[2].key, &s.quote_program)? >= obligations,
+                Error::InsufficientBudget,
+            )?;
+            // Distribution gas is a platform expense. The holder budgets are never debited.
+            s.platform_available = sub(s.platform_available, amount)?;
+            s.paid_platform = add(s.paid_platform, amount)?;
+            write(&a[2], &s)?;
+            token::pay(program, a, &s, amount)
+        }
         FusionInstruction::PayPlatform { amount } => {
             count(a, 10)?;
             let cfg = config(program, &a[1])?;
