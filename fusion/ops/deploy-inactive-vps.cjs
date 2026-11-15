@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 "use strict";
 // Deliberately pins the already-tested program release, independently of this
-// operational helper's commit. No initialization, activation or wallet transfers.
+// operational helper's commit. Initialization is explicit and always paused.
+// No activation, authority transfer, swaps, payouts or wallet funding.
 const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
 const { createRequire } = require("node:module");
 const { spawn, execFileSync } = require("node:child_process");
@@ -27,6 +28,17 @@ const VERIFY = Object.freeze({
   program: "verifycLy8mB96wd9wqq3WDXQwM4oU6r42Th37Db9fC",
   repository: "https://github.com/detox267/aaped-launch",
   args: ["--mount-path", "fusion", "--library-name", "moonz_fusion", "--arch", "v0"],
+});
+const INITIALIZE = Object.freeze({
+  feeWallet: "3mTCqBzGWMkUHqp3Ysepj3oewaMw6ndGQ368gEnxv1uH",
+  platform: "3gJPDjVbPMM5pSDbWJfmx28QMtp8vaJeUkfneZ25jsdU",
+  cpConfig: "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2",
+  launchlab: "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+  cpmm: "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+  // Bootstrap only. Activation must review a usable cap with the $30 sale policy.
+  maxSwapRaw: "1", configBytes: 202, computeUnits: 100000,
+  microLamportsPerCu: 50000, maxCostLamports: 10000000,
+  record: "initialize-paused-attempt.json",
 });
 const OWN_ERROR = Symbol("publicError");
 function need(ok, code) {
@@ -285,13 +297,176 @@ async function verifyPublicSource({ rpc, cfg, privateDir, binary, adminFile, Pub
     if (!verified) process.exitCode = 1;
   } finally { fs.closeSync(fd); fs.unlinkSync(configFile); }
 }
-let stage = "arguments", providerLabel = null;
+function initializeInstruction(web3) {
+  const { PublicKey, TransactionInstruction, SystemProgram } = web3;
+  const a = derive(PublicKey), cap = Buffer.alloc(8); cap.writeBigUInt64LE(BigInt(INITIALIZE.maxSwapRaw));
+  return new TransactionInstruction({ programId: a.program, keys: [
+    { pubkey: new PublicKey(PINS.admin), isSigner: true, isWritable: true },
+    { pubkey: a.config, isSigner: false, isWritable: true },
+    { pubkey: a.programData, isSigner: false, isWritable: false },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+  ], data: Buffer.concat([Buffer.from([0]), ...[PINS.operator, INITIALIZE.feeWallet,
+    INITIALIZE.platform, INITIALIZE.cpConfig].map(key => new PublicKey(key).toBuffer()), cap]) });
+}
+function checkInitializedConfig(account, PublicKey) {
+  const a = derive(PublicKey), data = account?.data;
+  need(account && !account.executable && account.owner.equals(a.program)
+    && data.length === INITIALIZE.configBytes && data[0] === 1, "unexpected_initialized_config");
+  const names = ["admin", "pendingAdmin", "operator", "feeWallet", "platform", "cpConfig"];
+  const keys = names.map((_, i) => new PublicKey(data.subarray(1 + i * 32, 33 + i * 32)).toBase58());
+  const expected = [PINS.admin, "11111111111111111111111111111111", PINS.operator,
+    INITIALIZE.feeWallet, INITIALIZE.platform, INITIALIZE.cpConfig];
+  need(keys.every((key, i) => key === expected[i]) && data.readBigUInt64LE(193) === BigInt(INITIALIZE.maxSwapRaw)
+    && data[201] === 1, "initialized_config_binding_or_pause_mismatch");
+  return { configAddress: a.config.toBase58(), ...Object.fromEntries(names.map((name, i) => [name, keys[i]])),
+    maxSwapRaw: INITIALIZE.maxSwapRaw, paused: true };
+}
+function checkInitializationPlatform(platform, cpConfig, PublicKey) {
+  const discriminator = name => crypto.createHash("sha256").update(`account:${name}`).digest().subarray(0, 8);
+  need(platform && !platform.executable && platform.owner.equals(new PublicKey(INITIALIZE.launchlab))
+    && platform.data.length === 944 && platform.data.subarray(0, 8).equals(discriminator("PlatformConfig")),
+  "initialization_platform_account_mismatch");
+  const d = platform.data, field = offset => new PublicKey(d.subarray(offset, offset + 32)).toBase58();
+  need(field(16) === INITIALIZE.feeWallet && field(688) === INITIALIZE.cpConfig
+    && [80, 88, 104, 720].every(offset => d.readBigUInt64LE(offset) === 0n)
+    && d.readBigUInt64LE(96) === 1000000n, "initialization_platform_policy_mismatch");
+  need(cpConfig && !cpConfig.executable && cpConfig.owner.equals(new PublicKey(INITIALIZE.cpmm))
+    && cpConfig.data.length === 236 && cpConfig.data.subarray(0, 8).equals(discriminator("AmmConfig"))
+    && cpConfig.data[9] === 0, "initialization_cpmm_config_mismatch");
+  const taxAuthority = PublicKey.findProgramAddressSync([Buffer.from("tax-authority")], new PublicKey(PINS.program))[0].toBase58();
+  need([PINS.operator, taxAuthority].includes(field(728)), "unexpected_platform_tax_authority");
+  return { platformTaxAuthority: field(728), requiredTaxAuthority: taxAuthority,
+    platformTaxAuthorityReady: field(728) === taxAuthority };
+}
+function initializationBudget(rent, fee, balance) {
+  need([rent, fee, balance].every(value => Number.isSafeInteger(value) && value >= 0)
+    && fee > 0 && rent > 0, "invalid_initialization_budget");
+  const cost = rent + fee;
+  need(Number.isSafeInteger(cost) && cost <= INITIALIZE.maxCostLamports, "initialization_cost_limit_exceeded");
+  need(balance >= cost + PINS.reserveLamports, "initialization_deployer_reserve_low");
+  return { configRentSol: rent / 1e9, estimatedTransactionFeeSol: fee / 1e9,
+    maximumCostThisTransactionSol: cost / 1e9, retainedDeployerReserveSol: PINS.reserveLamports / 1e9 };
+}
+function signatureBase58(bytes) {
+  need(bytes.length === 64 && bytes.some(byte => byte !== 0), "invalid_initialization_signature");
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let n = BigInt(`0x${Buffer.from(bytes).toString("hex")}`), encoded = "", zeros = 0;
+  while (n) { encoded = alphabet[Number(n % 58n)] + encoded; n /= 58n; }
+  while (bytes[zeros] === 0) zeros++;
+  return "1".repeat(zeros) + encoded;
+}
+async function initializePausedConfig({ rpc, cfg, privateDir, binary, adminFile, web3 }) {
+  const { PublicKey, Keypair, TransactionMessage, VersionedTransaction, ComputeBudgetProgram, SystemProgram } = web3;
+  const a = derive(PublicKey), [metadataPda] = verificationAddress(PublicKey);
+  const recordFile = path.join(privateDir, INITIALIZE.record);
+  stage = "initialization_preflight";
+  need(cfg.feeWallet?.toBase58() === INITIALIZE.feeWallet && cfg.platformId?.toBase58() === INITIALIZE.platform
+    && cfg.cpConfigId?.toBase58() === INITIALIZE.cpConfig, "initialization_backend_bindings_mismatch");
+  async function state() {
+    const result = await rpc.getMultipleAccountsInfoAndContext([a.program, a.programData, a.config, metadataPda,
+      new PublicKey(INITIALIZE.platform), new PublicKey(INITIALIZE.cpConfig)], "finalized");
+    const chain = checkDeployed({ program: result.value[0], programData: result.value[1], binary, PublicKey });
+    checkVerificationMetadata({ account: result.value[3], PublicKey, deploymentSlot: chain.deploymentSlot });
+    const platform = checkInitializationPlatform(result.value[4], result.value[5], PublicKey);
+    return { chain, platform, config: result.value[2], finalizedSlot: result.context.slot };
+  }
+  need(publicVerificationMatches(await publicVerificationStatus(), binary), "initialization_requires_public_verification");
+  let current = await state();
+  function existing() {
+    if (!current.config?.owner.equals(a.program)) return false;
+    console.log(JSON.stringify({ readOnly: true, transactionsSent: 0, status: "already_initialized_paused",
+      ...current.chain, configuration: checkInitializedConfig(current.config, PublicKey), ...current.platform,
+      finalizedSlot: current.finalizedSlot, configInitialized: true,
+      publicSourceVerificationConfirmed: true, activationAllowed: false }, null, 2));
+    return true;
+  }
+  function initializable() {
+    need(!current.config || (!current.config.executable && current.config.owner.equals(SystemProgram.programId)
+      && current.config.data.length === 0), "unexpected_existing_config_account");
+  }
+  if (existing()) return;
+  initializable();
+  need(!fs.existsSync(recordFile), "previous_initialization_requires_reconciliation");
+  stage = "initialization_transaction_preparation";
+  const [latest, rent, balance] = await Promise.all([rpc.getLatestBlockhash("finalized"),
+    rpc.getMinimumBalanceForRentExemption(INITIALIZE.configBytes, "finalized"),
+    rpc.getBalance(new PublicKey(PINS.admin), "finalized")]);
+  const message = new TransactionMessage({ payerKey: new PublicKey(PINS.admin), recentBlockhash: latest.blockhash,
+    instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: INITIALIZE.computeUnits }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: INITIALIZE.microLamportsPerCu }),
+      initializeInstruction(web3)] }).compileToV0Message();
+  const fee = (await rpc.getFeeForMessage(message, "finalized")).value;
+  const cost = initializationBudget(rent, fee, balance);
+  const tx = new VersionedTransaction(message);
+  privatePath(adminFile);
+  let bytes, signer;
+  try {
+    const values = JSON.parse(fs.readFileSync(adminFile, "utf8"));
+    need(Array.isArray(values) && values.length === 64 && values.every(n => Number.isInteger(n) && n >= 0 && n <= 255), "invalid_signer_file");
+    bytes = Uint8Array.from(values); values.fill(0); signer = Keypair.fromSecretKey(bytes);
+    need(signer.publicKey.toBase58() === PINS.admin, "signer_identity_mismatch");
+    tx.sign([signer]);
+  } finally { bytes?.fill(0); signer?.secretKey.fill(0); }
+  stage = "initialization_simulation";
+  const simulation = await rpc.simulateTransaction(tx, { sigVerify: true, commitment: "finalized",
+    accounts: { encoding: "base64", addresses: [a.config.toBase58()] } });
+  need(!simulation.value.err && simulation.value.accounts?.[0], "initialization_simulation_failed");
+  const simulated = simulation.value.accounts[0];
+  need(Array.isArray(simulated.data) && simulated.data[1] === "base64", "unexpected_simulation_encoding");
+  const planned = checkInitializedConfig({ ...simulated, owner: new PublicKey(simulated.owner),
+    data: Buffer.from(simulated.data[0], "base64") }, PublicKey);
+  // Recheck public verification and finalized bindings immediately before the durable send journal.
+  need(publicVerificationMatches(await publicVerificationStatus(), binary), "initialization_requires_public_verification");
+  current = await state();
+  if (existing()) return;
+  initializable();
+  need(await rpc.getBlockHeight("finalized") + 10 < latest.lastValidBlockHeight, "initialization_blockhash_too_old");
+  const raw = Buffer.from(tx.serialize()), signature = signatureBase58(tx.signatures[0]);
+  console.log(JSON.stringify({ status: "initialization_preflight_passed", ...current.chain,
+    configuration: planned, ...current.platform, ...cost, rpcProvider: providerLabel,
+    publicSourceVerificationConfirmed: true, activationAllowed: false }, null, 2));
+  stage = "initialization_journal";
+  writeNew(recordFile, JSON.stringify({ ...current.chain, configuration: planned, signature,
+    blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight,
+    transactionSha256: crypto.createHash("sha256").update(raw).digest("hex"),
+    signedTransactionBase64: raw.toString("base64"), startedAt: new Date().toISOString(), activationAllowed: false }, null, 2));
+  pendingTransactionSignature = signature;
+  stage = "initialization_submission";
+  // One signature only. No re-signing, new blockhash, or blind retry after interruption.
+  let sendAcknowledged = false;
+  try { sendAcknowledged = await rpc.sendRawTransaction(raw, { skipPreflight: false, preflightCommitment: "finalized", maxRetries: 3 }) === signature; }
+  catch { /* An RPC error can occur after broadcast; reconcile the original signature below. */ }
+  stage = "initialization_reconciliation";
+  for (let i = 0; i < 24; i++) {
+    let status = null;
+    try { status = (await rpc.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0]; }
+    catch { /* A transient read failure is not evidence that the send failed. */ }
+    if (status?.confirmationStatus === "finalized") {
+      need(!status.err, "initialization_transaction_failed");
+      current = await state();
+      const report = { status: "config_initialized_paused", signature, transactionsSent: 1, ...current.chain,
+        configuration: checkInitializedConfig(current.config, PublicKey), ...current.platform,
+        publicSourceVerificationConfirmed: true, configInitialized: true, finalizedSlot: current.finalizedSlot,
+        rpcProvider: providerLabel, activationAllowed: false };
+      writeNew(path.join(privateDir, "initialize-paused-receipt.json"), JSON.stringify(report, null, 2));
+      console.log(JSON.stringify(report, null, 2)); return;
+    }
+    if (i % 6 === 0) console.log("Waiting for the configuration transaction to finalize. Fusion will remain paused.");
+    if (i < 23) await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+  console.log(JSON.stringify({ status: "initialization_needs_reconciliation", signature, sendAcknowledged,
+    transactionsMayHaveBeenSent: true, activationAllowed: false,
+    note: "Keep the original initialization attempt record. Do not create another transaction." }, null, 2));
+  process.exitCode = 1;
+}
+let stage = "arguments", providerLabel = null, pendingTransactionSignature = null;
 async function main(argv = process.argv.slice(2)) {
   const resume = argv[0] === "--resume";
   const verify = argv[0] === "--verify";
-  const live = argv[0] === "--deploy" || resume || verify;
+  const initializePaused = argv[0] === "--initialize-paused";
+  const live = argv[0] === "--deploy" || resume || verify || initializePaused;
   const buildDir = live ? argv[1] : argv[0];
-  need(argv.length === (live ? 2 : 1) && typeof buildDir === "string" && path.isAbsolute(buildDir), "usage_node_helper_optional_deploy_resume_or_verify_absolute_fusion_directory");
+  need(argv.length === (live ? 2 : 1) && typeof buildDir === "string" && path.isAbsolute(buildDir), "usage_node_helper_optional_deploy_resume_verify_or_initialize_paused_absolute_fusion_directory");
   need(process.getuid() === 0, "run_on_vps_as_root");
   const apiDir = "/root/aaped-api", privateDir = "/root/.config/moonz-fusion";
   const programFile = path.join(privateDir, "program-id.json"), bufferFile = path.join(privateDir, "deployment-buffer.json");
@@ -332,12 +507,13 @@ async function main(argv = process.argv.slice(2)) {
   const [oldProgram, oldData, oldConfig, oldBuffer, adminAccount] = before.value;
   if (oldProgram) {
     const result = checkDeployed({ program: oldProgram, programData: oldData, binary, PublicKey });
+    if (initializePaused) { await initializePausedConfig({ rpc, cfg, privateDir, binary, adminFile, web3: fromApi("@solana/web3.js") }); return; }
     if (verify) { await verifyPublicSource({ rpc, cfg, privateDir, binary, adminFile, PublicKey }); return; }
     console.log(JSON.stringify({ readOnly: true, transactionsSent: 0, status: "already_deployed_matches_release", ...result,
       configPresent: !!oldConfig, publicSourceVerificationConfirmed: false, activationAllowed: false }, null, 2));
     return;
   }
-  need(!verify, "program_not_deployed");
+  need(!verify && !initializePaused, "program_not_deployed");
   need(!oldData && !oldConfig, "existing_accounts_require_deployment_recovery_review");
   let recovery = null;
   const recordFile = resume ? path.join(privateDir, RESUME.record) : attemptFile;
@@ -425,9 +601,11 @@ async function main(argv = process.argv.slice(2)) {
 }
 if (require.main === module) main().catch(e => {
   console.log(JSON.stringify({ status: "stopped", stage, error: safeError(e), rpcProvider: providerLabel, activationAllowed: false,
-    note: "If upload started, transactions may have landed. Preserve the keys, buffer and attempt record; share this report for reconciliation." }, null, 2));
+    ...(pendingTransactionSignature ? { signature: pendingTransactionSignature, transactionsMayHaveBeenSent: true } : {}),
+    note: "If submission started, transactions may have landed. Preserve the keys and attempt records; share this report for reconciliation." }, null, 2));
   process.exitCode = 1;
 });
 module.exports = { PINS, RESUME, VERIFY, checkBinary, checkDeployed, checkResume, activeBufferDeployment, rpcProvider,
   budget, deploymentArgs, readSigner, safeError, runCli, writeNew, verificationArgs, verificationAddress,
-  checkVerificationMetadata, normalizedHash, publicVerificationMatches };
+  checkVerificationMetadata, normalizedHash, publicVerificationMatches, INITIALIZE, initializeInstruction,
+  checkInitializedConfig, checkInitializationPlatform, initializationBudget, signatureBase58, initializePausedConfig };

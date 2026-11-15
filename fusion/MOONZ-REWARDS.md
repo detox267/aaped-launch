@@ -1,6 +1,6 @@
 # MOONZ holder rewards
 
-This is the **new Fusion program, deployed on mainnet but inactive** at `CVzSF4nNHwu12giZUo9WZYGBw5VAbmgFN11ywVXizfmo`. Public source verification and backend integration are still pending, and its config is not initialized. The original immutable Moonz program is called for purchases but remains unchanged. Fusion retains its upgrade authority and embedded security.txt. Complete public build verification before integration.
+This is the **new Fusion program, deployed on mainnet but inactive** at `CVzSF4nNHwu12giZUo9WZYGBw5VAbmgFN11ywVXizfmo`. Public source verification succeeded for release `58ee233a0f5505f7cc62a976dea282c67c553eca` on 2026-11-15; backend integration is still pending and its config is not initialized. The original immutable Moonz program is called for purchases but remains unchanged. Fusion retains its upgrade authority and embedded security.txt. Keep launches and rewards disabled until integration and canary checks pass.
 
 ## Money flow
 
@@ -45,7 +45,7 @@ The planner supports a pair matching MOONZ's current market quote, or MOONZ itse
 
 The current signed-journal runner remains **collection and first-sale only**. The new platform-funded distribution sender implements prepare-before-send journaling and finalized fee/payout receipts, but must still be called from the backend's tier progression and reviewed holder-snapshot flow. MOONZ purchase submissions and platform-profit withdrawals still need their release integration. This release does not automatically enable those operations. Persist exact signed bytes before submission, never re-sign an ambiguous transaction, revalidate quotes after simulation, and credit only finalized raw vault movements. ATA initialization rent comes from the operator's SOL and must be included in its debit/reserve checks.
 
-The live backend, launch website binding, new program deployment, public source verification and capped canary remain prerequisites. Source tests are not an independent audit or proof of mainnet readiness. Keep the release draft and live flags disabled until those concrete integration checks pass.
+The live backend, launch website binding, paused configuration, platform tax authority and capped canary remain prerequisites. Source tests are not an independent audit or proof of mainnet readiness. Keep the release draft and live flags disabled until those concrete integration checks pass.
 
 
 ## Distribution costs come out of the platform's 25%
