@@ -2,7 +2,7 @@
 
 Standalone native Solana program and CommonJS client for per-token launch/reward vaults. The program ID is supplied by the runtime, so the build contains no embedded deployment key. This directory is a separate Cargo workspace; it does not modify the OG program. See [MOONZ reward ABI and integration](MOONZ-REWARDS.md).
 
-**Status: local implementation; not deployed, not publicly verified, not connected to the live backend.** Keep launches/rewards disabled until the release checks below pass. Public source verification and upgradeability are both required.
+**Status: deployed on mainnet, inactive, awaiting public source verification and backend integration.** Program `CVzSF4nNHwu12giZUo9WZYGBw5VAbmgFN11ywVXizfmo` was deployed at slot `469697376` from the tested `58ee233a0f5505f7cc62a976dea282c67c553eca` binary. Its actual bytes and retained admin upgrade authority were independently checked; its config is not initialized and the recovery buffer is closed. Keep launches/rewards disabled until the remaining release checks pass. Public source verification and upgradeability are both required.
 
 ## Implemented behavior
 
@@ -44,7 +44,7 @@ The review workflow uses checksum-pinned `solana-verify 0.5.2`, builds in Docker
    The Docker output is the release artifact. Re-run all SBF tests against it. A locally compiled ELF is a development artifact until reproduced by this workflow.
 2. Run `node ops/budget.cjs target/deploy/moonz_fusion.so` against that artifact. The JSON separates permanent rent from conservative temporary-buffer rent. Optional second argument sets program capacity in bytes. Transaction fees, verification metadata and operator working balance are separate. Create the deployment keypair only on the VPS, outside Git, after the amount and authority are reviewed. Never share it.
 3. Deploy the reviewed Docker artifact to a **new** program address with an explicit retained upgrade authority. Record program ID, deployment transaction, binary hash, capacity, public commit and authority. Do not use the OG address or `--final`. The [VPS deployment helper](ops/VPS-DEPLOYMENT.md) pins the already-tested `58ee233` binary, its new program/recovery-buffer identities and the admin authority. Its default mode is read-only; explicit `--deploy` spends mainnet SOL, preserves a durable attempt record and checks the actual finalized bytes and authority. It never initializes or activates the application. The helper's newer source commit does not change the pinned program release.
-4. Verify the deployed artifact against the public commit (the upload requires the upgrade authority):
+4. Verify the deployed artifact against the public commit (the upload requires the upgrade authority). The pinned [VPS helper's `--verify` mode](ops/VPS-DEPLOYMENT.md#public-source-verification) rebuilds release `58ee233`, uses an isolated CLI signer configuration, checks finalized metadata, and submits/checks public verification. For manually operated equivalents, ensure the CLI signer configuration is valid as well as passing the explicit upload key:
    ```bash
    solana-verify verify-from-repo -u "$FUSION_RPC_URL" \
      --program-id "$FUSION_PROGRAM_ID" \

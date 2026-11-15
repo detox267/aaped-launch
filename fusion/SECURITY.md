@@ -3,7 +3,7 @@
 Report vulnerabilities privately using [GitHub security advisories](https://github.com/detox267/aaped-launch/security/advisories/new).
 Include the source commit, instruction/account inputs, expected behavior and a reproducible local test. Do not include private keys or exploit live funds.
 
-This is a new, un-deployed implementation undergoing review. No independent audit is claimed. The embedded security.txt identifies this policy and the public source repository. Source verification proves a deployed binary matches a public commit; it does not prove correctness.
+This is a new implementation deployed on mainnet but inactive and still undergoing review. Its config is not initialized; public source verification and backend integration remain pending. No independent audit is claimed. The embedded security.txt identifies this policy and the public source repository. Source verification proves a deployed binary matches a public commit; it does not prove correctness.
 
 ## Authority and trust boundaries
 

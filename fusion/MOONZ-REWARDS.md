@@ -1,6 +1,6 @@
 # MOONZ holder rewards
 
-This is a source change for the **new, undeployed Fusion program**. It is not a mainnet activation. The original immutable Moonz program is called for purchases but remains unchanged. Fusion keeps its upgrade authority and embedded security.txt. Build verification must be repeated for this new artifact before integration.
+This is the **new Fusion program, deployed on mainnet but inactive** at `CVzSF4nNHwu12giZUo9WZYGBw5VAbmgFN11ywVXizfmo`. Public source verification and backend integration are still pending, and its config is not initialized. The original immutable Moonz program is called for purchases but remains unchanged. Fusion retains its upgrade authority and embedded security.txt. Complete public build verification before integration.
 
 ## Money flow
 
