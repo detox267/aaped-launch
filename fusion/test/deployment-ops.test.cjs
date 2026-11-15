@@ -1,7 +1,7 @@
 const test = require("node:test"), assert = require("node:assert/strict");
 const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
 const { PublicKey, Keypair } = require("@solana/web3.js");
-const { PINS, budget, checkBinary, checkDeployed, deploymentArgs, readSigner, safeError, runCli, writeNew } = require("../ops/deploy-inactive-vps.cjs");
+const { PINS, budget, checkBinary, checkDeployed, checkResume, activeBufferDeployment, rpcProvider, deploymentArgs, readSigner, safeError, runCli, writeNew } = require("../ops/deploy-inactive-vps.cjs");
 const rents = [833120, 1238366840, 1238326200, 1676400];
 function fixture() {
   const owner = new PublicKey(PINS.loader), programKey = new PublicKey(PINS.program);
@@ -31,6 +31,58 @@ test("deployment arguments pin payer, retained authority, persistent recovery ke
   assert.equal(value("--with-compute-unit-price"), "10000");
   assert(a.includes("--use-rpc"));
   for (const flag of ["--final", "--skip-preflight", "--skip-feature-verify"]) assert(!a.includes(flag));
+});
+test("reviewed resume counts existing buffer rent once and bounds the new retry/fee settings", () => {
+  const b = budget(rents, 1761236999, 1238366841);
+  assert.equal(b.existingBufferRentCreditSol, 1.2383262);
+  assert.equal(b.minimumBalanceForThisPlanSol, 1.74087636);
+  assert.throws(() => budget(rents, 1740876359, 1238366841), /insufficient/);
+  const a = deploymentArgs({ binaryPath: "/reviewed.so", rpcUrl: "https://rpc.invalid", adminFile: "/admin.json", programFile: "/program.json", bufferFile: "/buffer.json", resume: true });
+  const value = name => a[a.indexOf(name) + 1];
+  assert.equal(value("--buffer"), "/buffer.json");
+  assert.equal(value("--program-id"), "/program.json");
+  assert.equal(value("--upgrade-authority"), "/admin.json");
+  assert.equal(value("--max-sign-attempts"), "20");
+  assert.equal(value("--with-compute-unit-price"), "50000");
+  assert(!a.includes("--final"));
+});
+test("recovery rejects substituted records, wrong buffer control and unexpected nonzero bytes", () => {
+  const binary = Buffer.from([9, 8, 0, 6]);
+  const data = Buffer.alloc(41); data.writeUInt32LE(1); data[4] = 1;
+  new PublicKey(PINS.admin).toBuffer().copy(data, 5); data[37] = 9;
+  const base = { buffer: { owner: new PublicKey(PINS.loader), executable: false, data },
+    attempt: { programId: PINS.program, deploymentBuffer: PINS.buffer, upgradeAuthority: PINS.admin,
+      releaseCommit: PINS.commit, binarySha256: PINS.sha256, capacityBytes: PINS.bytes,
+      configWillBeInitialized: false, activationAllowed: false }, binary, PublicKey };
+  assert.equal(checkResume(base).remainingDifferentBytes, 2);
+  for (const change of [
+    f => { f.attempt.programId = PINS.admin; },
+    f => { f.attempt.binarySha256 = "0".repeat(64); },
+    f => { f.buffer.owner = Keypair.generate().publicKey; },
+    f => { f.buffer.data[4] = 0; },
+    f => { f.buffer.data[5] ^= 1; },
+    f => { f.buffer.data[38] = 7; },
+    f => { f.buffer.executable = true; },
+  ]) {
+    const f = { ...base, attempt: { ...base.attempt }, buffer: { ...base.buffer, data: Buffer.from(data) } };
+    change(f); assert.throws(() => checkResume(f));
+  }
+});
+test("active original CLI blocks another upload without printing its RPC credentials", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-process-check-"));
+  try {
+    fs.mkdirSync(path.join(dir, "123"));
+    fs.writeFileSync(path.join(dir, "123/cmdline"), ["/usr/local/bin/solana", "program", "deploy", "--buffer", "/saved-buffer.json", "--url", "https://rpc.invalid/SECRET", ""].join("\0"));
+    assert.equal(activeBufferDeployment("/saved-buffer.json", dir), true);
+    assert.equal(activeBufferDeployment("/other-buffer.json", dir), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test("provider diagnostics reveal only a known provider label, never the endpoint or key", () => {
+  assert.equal(rpcProvider("https://mainnet.helius-rpc.com/?api-key=SECRET"), "Helius");
+  assert.equal(rpcProvider("https://rpc.helius.xyz/?api-key=SECRET"), "Helius");
+  assert.equal(rpcProvider("https://api.mainnet-beta.solana.com"), "Solana public RPC");
+  assert.equal(rpcProvider("https://helius-rpc.com.untrusted.invalid/SECRET"), "other_or_proxy");
+  assert.equal(rpcProvider("https://user:SECRET@private.invalid/SECRET"), "other_or_proxy");
 });
 test("a successful CLI exit alone cannot establish deployment identity or upgrade authority", () => {
   assert.equal(checkDeployed(fixture()).upgradeAuthority, PINS.admin);

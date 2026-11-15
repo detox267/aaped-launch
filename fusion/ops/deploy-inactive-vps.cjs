@@ -19,6 +19,8 @@ const PINS = Object.freeze({
   microLamportsPerCu: 10000,
   maxSignAttempts: 5,
 });
+const RESUME = Object.freeze({ microLamportsPerCu: 50000, maxSignAttempts: 20,
+  originalLog: "deployment-1794736155952.log", record: "deployment-resume-1.json" });
 const OWN_ERROR = Symbol("publicError");
 function need(ok, code) {
   if (!ok) { const e = new Error(code); e[OWN_ERROR] = code; throw e; }
@@ -28,6 +30,12 @@ function safeError(e) {
   if (code) return code;
   return ["ENOENT", "EACCES", "EPERM", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND"].includes(e?.code)
     ? e.code : "operation_failed";
+}
+function rpcProvider(url) {
+  const host = new URL(url).hostname.toLowerCase();
+  if (["helius-rpc.com", "helius.xyz"].some(domain => host === domain || host.endsWith(`.${domain}`))) return "Helius";
+  if (["api.mainnet-beta.solana.com", "api.mainnet.solana.com"].includes(host)) return "Solana public RPC";
+  return "other_or_proxy";
 }
 function privatePath(filename, directory = false) {
   const s = fs.lstatSync(filename);
@@ -71,22 +79,54 @@ function checkDeployed({ program, programData, binary, PublicKey }) {
     deploymentSlot: programData.data.readBigUInt64LE(4).toString(),
     binarySha256: PINS.sha256, releaseCommit: PINS.commit };
 }
-function budget(rents, balance) {
-  need(rents.length === 4 && [...rents, balance].every(n => Number.isSafeInteger(n) && n >= 0), "invalid_rpc_amount");
+function budget(rents, balance, existingBufferLamports = 0) {
+  need(rents.length === 4 && [...rents, balance, existingBufferLamports].every(n => Number.isSafeInteger(n) && n >= 0), "invalid_rpc_amount");
   const persistent = rents[0] + rents[1] + rents[3];
-  const peak = persistent + rents[2], required = peak + PINS.reserveLamports;
+  const peak = persistent + rents[2], credit = Math.min(existingBufferLamports, rents[2]);
+  const required = peak - credit + PINS.reserveLamports;
   need(Number.isSafeInteger(required), "invalid_rpc_amount");
   need(balance >= required, "insufficient_deployer_balance");
   return { adminBalanceSol: balance / 1e9, persistentRentIncludingConfigSol: persistent / 1e9,
     conservativeTemporaryRentPeakSol: peak / 1e9, extraReserveSol: PINS.reserveLamports / 1e9,
+    existingBufferRentCreditSol: credit / 1e9,
     minimumBalanceForThisPlanSol: required / 1e9 };
 }
-function deploymentArgs({ binaryPath, rpcUrl, adminFile, programFile, bufferFile }) {
+function checkResume({ buffer, attempt, binary, PublicKey }) {
+  need(attempt?.programId === PINS.program && attempt.deploymentBuffer === PINS.buffer
+    && attempt.upgradeAuthority === PINS.admin && attempt.releaseCommit === PINS.commit
+    && attempt.binarySha256 === PINS.sha256 && attempt.capacityBytes === PINS.bytes
+    && attempt.configWillBeInitialized === false && attempt.activationAllowed === false,
+  "original_attempt_identity_mismatch");
+  need(buffer && !buffer.executable && buffer.owner.equals(new PublicKey(PINS.loader))
+    && buffer.data.length === 37 + binary.length && buffer.data.readUInt32LE(0) === 1,
+  "recovery_buffer_mismatch");
+  need(buffer.data[4] === 1 && new PublicKey(buffer.data.subarray(5, 37)).toBase58() === PINS.admin,
+    "recovery_buffer_authority_mismatch");
+  let remainingDifferentBytes = 0;
+  for (let i = 0; i < binary.length; i++) {
+    const actual = buffer.data[37 + i];
+    need(actual === 0 || actual === binary[i], "unexpected_buffer_contents");
+    if (actual !== binary[i]) remainingDifferentBytes++;
+  }
+  return { remainingDifferentBytes, bufferMatchesBinary: remainingDifferentBytes === 0,
+    bufferSha256: crypto.createHash("sha256").update(buffer.data).digest("hex") };
+}
+function activeBufferDeployment(bufferFile, procRoot = "/proc") {
+  return fs.readdirSync(procRoot).filter(p => /^[0-9]+$/.test(p)).some(p => {
+    let args;
+    try { args = fs.readFileSync(path.join(procRoot, p, "cmdline"), "utf8").split("\0"); }
+    catch (e) { if (e.code === "ENOENT" || e.code === "ESRCH") return false; throw e; }
+    return path.basename(args[0] || "") === "solana" && args.includes("program") && args.includes("deploy")
+      && (args.includes(bufferFile) || args.includes(PINS.buffer) || args.includes(PINS.program));
+  });
+}
+function deploymentArgs({ binaryPath, rpcUrl, adminFile, programFile, bufferFile, resume = false }) {
+  const policy = resume ? RESUME : PINS;
   return ["program", "deploy", binaryPath, "--url", rpcUrl,
     "--keypair", adminFile, "--fee-payer", adminFile, "--upgrade-authority", adminFile,
     "--program-id", programFile, "--buffer", bufferFile, "--max-len", String(PINS.bytes),
-    "--with-compute-unit-price", String(PINS.microLamportsPerCu),
-    "--max-sign-attempts", String(PINS.maxSignAttempts), "--use-rpc",
+    "--with-compute-unit-price", String(policy.microLamportsPerCu),
+    "--max-sign-attempts", String(policy.maxSignAttempts), "--use-rpc",
     "--commitment", "confirmed", "--output", "json-compact"];
 }
 function writeNew(filename, text) {
@@ -103,11 +143,12 @@ async function runCli(args, fd, command = "solana") {
     child.once("close", (code, signal) => { clearInterval(timer); resolve({ exitCode: code, signal }); });
   });
 }
-let stage = "arguments";
+let stage = "arguments", providerLabel = null;
 async function main(argv = process.argv.slice(2)) {
-  const live = argv[0] === "--deploy";
+  const resume = argv[0] === "--resume";
+  const live = argv[0] === "--deploy" || resume;
   const buildDir = live ? argv[1] : argv[0];
-  need(argv.length === (live ? 2 : 1) && typeof buildDir === "string" && path.isAbsolute(buildDir), "usage_node_helper_optional_deploy_absolute_fusion_directory");
+  need(argv.length === (live ? 2 : 1) && typeof buildDir === "string" && path.isAbsolute(buildDir), "usage_node_helper_optional_deploy_or_resume_absolute_fusion_directory");
   need(process.getuid() === 0, "run_on_vps_as_root");
   const apiDir = "/root/aaped-api", privateDir = "/root/.config/moonz-fusion";
   const programFile = path.join(privateDir, "program-id.json"), bufferFile = path.join(privateDir, "deployment-buffer.json");
@@ -123,6 +164,8 @@ async function main(argv = process.argv.slice(2)) {
   const { Connection, Keypair, PublicKey } = fromApi("@solana/web3.js");
   const { parse } = fromApi("dotenv");
   const cfg = fromApi("./launchlab/config").readConfig(parse(fs.readFileSync(path.join(apiDir, ".env"), "utf8")));
+  providerLabel = rpcProvider(cfg.rpcUrl);
+  if (resume) need(providerLabel !== "Solana public RPC", "resume_requires_configured_provider_rpc");
   need(cfg.cluster === "mainnet-beta" && cfg.admin?.toBase58() === PINS.admin
     && cfg.rewards?.wallet?.toBase58() === PINS.operator, "configuration_identity_mismatch");
   need(!cfg.requestedEnabled && !cfg.rewards.enabled && !cfg.rewards.live, "backend_live_flags_must_remain_disabled");
@@ -150,32 +193,66 @@ async function main(argv = process.argv.slice(2)) {
       configPresent: !!oldConfig, publicSourceVerificationConfirmed: false, activationAllowed: false }, null, 2));
     return;
   }
-  need(!oldData && !oldConfig && !oldBuffer, "existing_accounts_require_deployment_recovery_review");
-  need(!fs.existsSync(attemptFile), "previous_attempt_requires_reconciliation");
+  need(!oldData && !oldConfig, "existing_accounts_require_deployment_recovery_review");
+  let recovery = null;
+  const recordFile = resume ? path.join(privateDir, RESUME.record) : attemptFile;
+  if (resume) {
+    stage = "reconcile_original_upload";
+    need(!fs.existsSync(recordFile), "resume_already_attempted_requires_reconciliation");
+    need(!activeBufferDeployment(bufferFile), "original_deployment_process_still_running");
+    privatePath(attemptFile);
+    const attempt = JSON.parse(fs.readFileSync(attemptFile, "utf8"));
+    recovery = checkResume({ buffer: oldBuffer, attempt, binary, PublicKey });
+    const originalLog = path.join(privateDir, RESUME.originalLog);
+    privatePath(originalLog);
+    const log = fs.readFileSync(originalLog, "utf8");
+    need(/max(?:imum)? retries exceeded/i.test(log)
+      && !/insufficient (?:funds|lamports)|authority mismatch|program failed verification|failed to verify program|simulation failed/i.test(log),
+    "original_failure_needs_different_recovery");
+    const recent = await rpc.getSignaturesForAddress(buffer, { limit: 1 }, "confirmed");
+    need(recent.length === 1 && recent[0].confirmationStatus === "finalized", "buffer_history_not_finalized");
+    const confirmed = await rpc.getMultipleAccountsInfoAndContext([program, a.programData, a.config, buffer],
+      { commitment: "confirmed", minContextSlot: before.context.slot });
+    need(!confirmed.value[0] && !confirmed.value[1] && !confirmed.value[2]
+      && !confirmed.value[3]?.executable && confirmed.value[3]?.owner.equals(oldBuffer.owner)
+      && confirmed.value[3]?.data.equals(oldBuffer.data)
+      && confirmed.value[3]?.lamports === oldBuffer.lamports, "deployment_state_changed_recheck_before_resume");
+    recovery.lastFinalizedBufferSignature = recent[0].signature;
+    recovery.reconciledFinalizedSlot = before.context.slot;
+    recovery.reconciledConfirmedSlot = confirmed.context.slot;
+  } else {
+    need(!oldBuffer, "existing_accounts_require_deployment_recovery_review");
+    need(!fs.existsSync(attemptFile), "previous_attempt_requires_reconciliation");
+  }
   need(adminAccount && !adminAccount.executable && adminAccount.owner.equals(new PublicKey("11111111111111111111111111111111"))
     && adminAccount.data.length === 0, "unexpected_deployer_account");
   const rents = await Promise.all([36, 45 + PINS.bytes, 37 + PINS.bytes, 202].map(n => rpc.getMinimumBalanceForRentExemption(n)));
   const plan = { programId: PINS.program, deploymentBuffer: PINS.buffer, upgradeAuthority: PINS.admin,
+    rpcProvider: providerLabel,
     releaseCommit: PINS.commit, binarySha256: PINS.sha256, capacityBytes: PINS.bytes,
-    ...budget(rents, adminAccount.lamports), microLamportsPerCu: PINS.microLamportsPerCu, maxSignAttempts: PINS.maxSignAttempts,
+    ...budget(rents, adminAccount.lamports, resume ? oldBuffer.lamports : 0),
+    microLamportsPerCu: resume ? RESUME.microLamportsPerCu : PINS.microLamportsPerCu,
+    maxSignAttempts: resume ? RESUME.maxSignAttempts : PINS.maxSignAttempts,
+    resumeExistingBuffer: resume, ...(recovery ? { recovery } : {}),
     configWillBeInitialized: false, activationAllowed: false };
   stage = "cli_flags";
   const help = execFileSync("solana", ["program", "deploy", "--help"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  const args = deploymentArgs({ binaryPath, rpcUrl: cfg.rpcUrl, adminFile, programFile, bufferFile });
+  const args = deploymentArgs({ binaryPath, rpcUrl: cfg.rpcUrl, adminFile, programFile, bufferFile, resume });
   for (const arg of args.filter(s => s.startsWith("--"))) need(help.includes(arg), "required_cli_option_unavailable");
   console.log(JSON.stringify({ readOnly: !live, transactionsSent: 0, status: "preflight_passed", ...plan }, null, 2));
   if (!live) return;
   stage = "record_deployment_attempt";
   checkBinary(fs.readFileSync(binaryPath));
-  // O_EXCL + fsync prevents a second invocation from starting another attempt,
-  // even after SSH loss. An uncertain attempt must be reconciled, not re-signed.
-  writeNew(attemptFile, JSON.stringify({ ...plan, startedAt: new Date().toISOString() }, null, 2));
-  const logFile = path.join(privateDir, `deployment-${Date.now()}.log`);
+  // Retain the original record. A reviewed resume has its own exclusive record;
+  // it cannot be repeated or silently incremented after another uncertain exit.
+  writeNew(recordFile, JSON.stringify({ ...plan, startedAt: new Date().toISOString() }, null, 2));
+  const logFile = path.join(privateDir, `deployment${resume ? "-resume" : ""}-${Date.now()}.log`);
   const fd = fs.openSync(logFile, "wx", 0o600);
   let cli;
   try {
     stage = "deployment_upload";
-    console.log("Starting mainnet program deployment. Launches and rewards remain disabled.");
+    console.log(resume ? "Resuming the existing mainnet buffer. Launches and rewards remain disabled."
+      : "Starting mainnet program deployment. Launches and rewards remain disabled.");
     cli = await runCli(args, fd);
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
@@ -202,8 +279,8 @@ async function main(argv = process.argv.slice(2)) {
   process.exitCode = 1;
 }
 if (require.main === module) main().catch(e => {
-  console.log(JSON.stringify({ status: "stopped", stage, error: safeError(e), activationAllowed: false,
+  console.log(JSON.stringify({ status: "stopped", stage, error: safeError(e), rpcProvider: providerLabel, activationAllowed: false,
     note: "If upload started, transactions may have landed. Preserve the keys, buffer and attempt record; share this report for reconciliation." }, null, 2));
   process.exitCode = 1;
 });
-module.exports = { PINS, checkBinary, checkDeployed, budget, deploymentArgs, readSigner, safeError, runCli, writeNew };
+module.exports = { PINS, RESUME, checkBinary, checkDeployed, checkResume, activeBufferDeployment, rpcProvider, budget, deploymentArgs, readSigner, safeError, runCli, writeNew };
