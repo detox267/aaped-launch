@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { setup, Keypair, spl, c, SystemProgram } = require("./helpers.cjs");
 
-test("pre-funding launch and unwrap PDAs cannot block launch or change the holder amount", () => {
+test("pre-funding launch and unwrap PDAs cannot block launch or change the platform amount", () => {
   const t = setup({ raydium: true });
   const l = t.launch();
   const base = l.mint.publicKey;
@@ -39,35 +39,24 @@ test("pre-funding launch and unwrap PDAs cannot block launch or change the holde
     ],
     [t.operator],
   );
-  const recipient = Keypair.generate().publicKey;
-  t.svm.airdrop(recipient.toBase58(), 1_000_000n);
-  const r = c.merkleRound(t.program, base, 1, [
-    { recipient, amount: 7_500_000n },
-  ]);
-  t.send(
-    [
-      c.openRound(t.program, t.operator.publicKey, base, {
-        ...r,
-        deadline: t.svm.getClock().unixTimestamp + 3600n,
-      }),
-    ],
-    [t.operator],
-  );
+  const recipient = t.fee.publicKey;
   const before = t.svm.getBalance(recipient.toBase58());
   t.send(
     [
-      c.pay(
+      c.payPlatform(
         t.program,
         t.operator.publicKey,
         base,
         l.quote,
         spl.TOKEN_PROGRAM_ID,
-        r.entries[0],
+        recipient,
+        2_500_000n,
       ),
     ],
     [t.operator],
   );
-  assert.equal(t.svm.getBalance(recipient.toBase58()) - before, 7_500_000n);
-  assert.equal(t.balance(l.a.quoteVault), 2_500_000n);
-  assert.equal(t.launchState(base).platformAvailable, 2_500_000n);
+  assert.equal(t.svm.getBalance(recipient.toBase58()) - before, 2_500_000n);
+  assert.equal(t.balance(l.a.quoteVault), 7_500_000n);
+  assert.equal(t.launchState(base).holderAvailable, 7_500_000n);
+  assert.equal(t.launchState(base).platformAvailable, 0n);
 });

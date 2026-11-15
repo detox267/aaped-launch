@@ -4,6 +4,9 @@ use solana_program::{
 };
 
 pub const VERSION: u8 = 1;
+pub const MOONZ_LAUNCH_VERSION: u8 = 2;
+pub const REWARDS_SEED: &[u8] = b"rewards";
+pub const REWARDS_LEN: usize = 1 + 32 + 8 * 8 + 32 + 128;
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const AUTH_SEED: &[u8] = b"tax-authority";
 pub const LAUNCH_SEED: &[u8] = b"launch";
@@ -207,6 +210,27 @@ pub enum FusionInstruction {
         amount: u64,
     },
     CreditDonation,
+    InitializeRewards,
+    BuyMoonz {
+        amount: u64,
+        min_bridge_out: u64,
+        min_moonz_out: u64,
+        deadline: u64,
+        bridge_data: Vec<u8>,
+    },
+    OpenMoonzRound {
+        root: [u8; 32],
+        total: u64,
+        leaves: u32,
+        deadline: u64,
+    },
+    PayMoonz {
+        round: u64,
+        index: u32,
+        amount: u64,
+        proof: Vec<[u8; 32]>,
+    },
+    CloseMoonzRound,
 }
 
 pub fn read<T: BorshDeserialize>(account: &AccountInfo, owner: &Pubkey, len: usize) -> Result<T> {
@@ -253,4 +277,86 @@ pub fn verify_proof(mut node: [u8; 32], proof: &[[u8; 32]], root: [u8; 32]) -> R
         .to_bytes();
     }
     require(node == root, Error::InvalidProof)
+}
+
+// Every amount here is raw MOONZ except quote_spent (the launch's paired asset).
+// The reward PDA is also the Merkle domain account, distinct from the legacy launch domain.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
+pub struct Rewards {
+    pub version: u8,
+    pub launch: Pubkey,
+    pub available: u64,
+    pub credited: u64,
+    pub paid: u64,
+    pub quote_spent: u64,
+    pub round: u64,
+    pub remaining: u64,
+    pub deadline: u64,
+    pub leaves: u64,
+    pub root: [u8; 32],
+    pub bitmap: [u8; 128],
+}
+impl Rewards {
+    pub fn obligations(&self) -> Result<u64> {
+        add(self.available, self.remaining)
+    }
+    pub fn credit(&mut self, amount: u64, quote_spent: u64) -> Result<()> {
+        require(amount > 0, Error::InvalidAmount)?;
+        self.available = add(self.available, amount)?;
+        self.credited = add(self.credited, amount)?;
+        self.quote_spent = add(self.quote_spent, quote_spent)?;
+        Ok(())
+    }
+    pub fn open_round(
+        &mut self,
+        root: [u8; 32],
+        total: u64,
+        leaves: u32,
+        deadline: u64,
+        now: u64,
+    ) -> Result<()> {
+        require(self.deadline == 0, Error::RoundActive)?;
+        require(
+            total > 0 && leaves > 0 && leaves <= MAX_LEAVES && root != [0; 32],
+            Error::InvalidAmount,
+        )?;
+        require(
+            deadline >= add(now, 3600)? && deadline <= add(now, 30 * 86400)?,
+            Error::Expired,
+        )?;
+        self.available = sub(self.available, total)?;
+        self.round = add(self.round, 1)?;
+        self.root = root;
+        self.remaining = total;
+        self.leaves = leaves.into();
+        self.deadline = deadline;
+        self.bitmap = [0; 128];
+        Ok(())
+    }
+    pub fn mark_paid(&mut self, index: u32, amount: u64, now: u64) -> Result<()> {
+        require(self.deadline != 0 && now < self.deadline, Error::Expired)?;
+        require(
+            u64::from(index) < self.leaves && amount > 0,
+            Error::InvalidAmount,
+        )?;
+        let byte = index as usize / 8;
+        let bit = 1 << (index % 8);
+        require(self.bitmap[byte] & bit == 0, Error::AlreadyPaid)?;
+        self.remaining = sub(self.remaining, amount)?;
+        self.paid = add(self.paid, amount)?;
+        self.bitmap[byte] |= bit;
+        Ok(())
+    }
+    pub fn close_round(&mut self, now: u64) -> Result<()> {
+        require(
+            self.deadline != 0 && (self.remaining == 0 || now >= self.deadline),
+            Error::RoundActive,
+        )?;
+        self.available = add(self.available, self.remaining)?;
+        self.remaining = 0;
+        self.deadline = 0;
+        self.root = [0; 32];
+        self.leaves = 0;
+        Ok(())
+    }
 }

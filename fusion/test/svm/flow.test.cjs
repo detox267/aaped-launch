@@ -109,21 +109,38 @@ test("real CPMM program converts only this CA vault on the pinned pair using the
   );
   const amount = t.balance(l.a.baseVault, spl.TOKEN_2022_PROGRAM_ID);
   const { PublicKey } = require("@solana/web3.js");
-  const info = key => {
-    const a = t.get(key), data = Buffer.from(a.data);
+  const info = (key) => {
+    const a = t.get(key),
+      data = Buffer.from(a.data);
     // Quote fixture only: the actual privileged graduation service is not run.
     if (key.equals(l.pool)) data[sdk.LaunchpadPool.offsetOf("status")] = 2;
     return { ...a, owner: new PublicKey(a.programAddress), data };
   };
-  const rpc = { getAccountInfo: async key => info(key), getMultipleAccountsInfo: async keys => keys.map(info),
-    getEpochInfo: async () => ({ epoch: Number(t.svm.getClock().epoch), absoluteSlot: Number(t.svm.getClock().slot) }) };
-  const quoted = await require("../../worker/quotes.cjs").raydiumQuote(rpc, {
-    state: t.launchState(base), addresses: l.a,
-    baseMint: spl.unpackMint(base, info(base), spl.TOKEN_2022_PROGRAM_ID),
-    quoteMint: spl.unpackMint(quote, info(quote), spl.TOKEN_PROGRAM_ID),
-  }, { platform: t.platform, cpConfig: t.cpConfig }, amount, 100, 0);
-  const minOut = BigInt(quoted.minOut), swap = require("../../worker/common.cjs").decodeInstruction(quoted.swap);
-  assert.equal(quoted.route, "cpmm"); assert(minOut > 1n);
+  const rpc = {
+    getAccountInfo: async (key) => info(key),
+    getMultipleAccountsInfo: async (keys) => keys.map(info),
+    getEpochInfo: async () => ({
+      epoch: Number(t.svm.getClock().epoch),
+      absoluteSlot: Number(t.svm.getClock().slot),
+    }),
+  };
+  const quoted = await require("../../worker/quotes.cjs").raydiumQuote(
+    rpc,
+    {
+      state: t.launchState(base),
+      addresses: l.a,
+      baseMint: spl.unpackMint(base, info(base), spl.TOKEN_2022_PROGRAM_ID),
+      quoteMint: spl.unpackMint(quote, info(quote), spl.TOKEN_PROGRAM_ID),
+    },
+    { platform: t.platform, cpConfig: t.cpConfig },
+    amount,
+    100,
+    0,
+  );
+  const minOut = BigInt(quoted.minOut),
+    swap = require("../../worker/common.cjs").decodeInstruction(quoted.swap);
+  assert.equal(quoted.route, "cpmm");
+  assert(minOut > 1n);
   const ix = c.convert(
     t.program,
     t.operator.publicKey,
@@ -190,8 +207,15 @@ test("bad slippage and cross-token tax sources roll back balances", () => {
   assert.equal(t.balance(a.a.baseVault, spl.TOKEN_2022_PROGRAM_ID), raw);
   assert.equal(t.launchState(a.mint.publicKey).credited, 0n);
 });
-test("real buy → withheld tax collection → conversion → 75/25 native payouts, without double payment", () => {
+test("real tax collection and sale -> MOONZ purchase -> holder payout, paired platform payout", () => {
+  const {
+    r,
+    loadMoonz,
+    rewardsState,
+    buyMoonz,
+  } = require("./rewards-helpers.cjs");
   const t = setup({ raydium: true }),
+    market = loadMoonz(t),
     l = t.launch(),
     base = l.mint.publicKey;
   t.send([l.instruction], [t.admin, l.mint]);
@@ -200,43 +224,50 @@ test("real buy → withheld tax collection → conversion → 75/25 native payou
     [c.collect(t.program, t.operator.publicKey, base, [userAta])],
     [t.operator],
   );
-  const tax = t.balance(l.a.baseVault, spl.TOKEN_2022_PROGRAM_ID);
-  assert(tax > 0n);
-  t.send([t.convert(l, tax)], [t.operator]);
+  t.send(
+    [t.convert(l, t.balance(l.a.baseVault, spl.TOKEN_2022_PROGRAM_ID))],
+    [t.operator],
+  );
   const s = t.launchState(base);
+  assert.equal(s.version, 2);
   assert(s.credited > 0n);
   assert.equal(s.platformAvailable, s.credited / 4n);
-  assert.equal(s.holderAvailable, s.credited - s.platformAvailable);
-  const recipient = Keypair.generate().publicKey;
-  t.svm.airdrop(recipient.toBase58(), 1_000_000n);
-  const r = c.merkleRound(t.program, base, 1, [
-    { recipient, amount: s.holderAvailable },
+  t.send([r.initialize(t.program, t.operator.publicKey, base)], [t.operator]);
+  t.send([buyMoonz(t, base, s.holderAvailable, market)], [t.operator]);
+  const reward = rewardsState(t, base);
+  assert(reward.available > 0n);
+  assert.equal(reward.quoteSpent, s.holderAvailable);
+  assert.equal(t.launchState(base).holderAvailable, 0n);
+  assert.equal(t.balance(l.a.quoteVault), s.platformAvailable);
+  const recipient = Keypair.generate().publicKey,
+    ata = spl.getAssociatedTokenAddressSync(r.MOONZ, recipient);
+  t.send([
+    spl.createAssociatedTokenAccountIdempotentInstruction(
+      t.admin.publicKey,
+      ata,
+      recipient,
+      r.MOONZ,
+    ),
+  ]);
+  const round = r.merkleRound(t.program, base, 1, [
+    { recipient, amount: reward.available },
   ]);
   t.send(
     [
-      c.openRound(t.program, t.operator.publicKey, base, {
-        ...r,
+      r.openRound(t.program, t.operator.publicKey, base, {
+        ...round,
         deadline: t.svm.getClock().unixTimestamp + 3600n,
       }),
     ],
     [t.operator],
   );
-  const before = t.svm.getBalance(recipient.toBase58()),
-    pay = c.pay(
-      t.program,
-      t.operator.publicKey,
-      base,
-      l.quote,
-      spl.TOKEN_PROGRAM_ID,
-      r.entries[0],
-    );
-  t.send([pay], [t.operator]);
-  assert.equal(
-    t.svm.getBalance(recipient.toBase58()) - before,
-    s.holderAvailable,
-  );
-  t.send([pay], [t.operator], false);
-  const beforeFee = t.svm.getBalance(t.fee.publicKey.toBase58());
+  const pay = r.pay(t.program, base, round.entries[0]);
+  t.send([pay]);
+  assert.equal(t.balance(ata), reward.available);
+  t.send([pay], [t.admin], false);
+  t.send([r.closeRound(t.program, base)]);
+  assert.equal(rewardsState(t, base).remaining, 0n);
+  const before = t.svm.getBalance(t.fee.publicKey.toBase58());
   t.send(
     [
       c.payPlatform(
@@ -252,10 +283,8 @@ test("real buy → withheld tax collection → conversion → 75/25 native payou
     [t.operator],
   );
   assert.equal(
-    t.svm.getBalance(t.fee.publicKey.toBase58()) - beforeFee,
+    t.svm.getBalance(t.fee.publicKey.toBase58()) - before,
     s.platformAvailable,
   );
   assert.equal(t.balance(l.a.quoteVault), 0n);
-  t.send([c.closeRound(t.program, base)]);
-  assert.equal(t.launchState(base).remaining, 0n);
 });

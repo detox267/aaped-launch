@@ -1,6 +1,8 @@
 #![allow(deprecated)]
 mod processor;
 mod raydium;
+mod reward_swap;
+mod rewards;
 pub mod state;
 mod token;
 

@@ -336,10 +336,10 @@ const parent = (a, b) =>
     Buffer.from("MOONZ_FUSION_NODE_V1"),
     ...(Buffer.compare(a, b) <= 0 ? [a, b] : [b, a]),
   );
-function merkleRound(program, base, round, payments) {
+function merkleRound(program, base, round, payments, domainAccount = addresses(program, base).launch) {
   if (!payments.length || payments.length > 1024)
     throw new Error("Split into rounds of at most 1024 recipients");
-  const launch = addresses(program, base).launch,
+  const launch = pk(domainAccount),
     wallets = new Set();
   let total = 0n;
   const entries = payments.map((p, index) => {
@@ -381,9 +381,9 @@ function merkleRound(program, base, round, payments) {
   }
   return { root: layer[0].hash, total, leaves: entries.length, entries };
 }
-function decoder(data, length) {
+function decoder(data, length, versions = [1]) {
   data = Buffer.from(data);
-  if (data.length !== length || data[0] !== 1)
+  if (data.length !== length || !versions.includes(data[0]))
     throw new Error("Unsupported Fusion state");
   let i = 1;
   return {
@@ -420,8 +420,10 @@ function decodeConfig(data) {
   return { ...cfg, paused: !!flag };
 }
 function decodeLaunch(data) {
-  const r = decoder(data, 393);
+  const r = decoder(data, 393, [1, 2]);
   return {
+    version: Buffer.from(data)[0],
+    rewardAsset: Buffer.from(data)[0] === 2 ? "MOONZ" : "paired",
     base: r.key(),
     quote: r.key(),
     quoteProgram: r.key(),

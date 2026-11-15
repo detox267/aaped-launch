@@ -111,3 +111,31 @@ fn proofs_bind_ca_and_epoch() {
     .is_err());
     assert!(verify_proof(leaf(&program, &launch, 2, 0, &wallet, 123), &[], root).is_err());
 }
+
+#[test]
+fn moonz_ledger_has_separate_units_and_rolls_net_amount_without_second_fee() {
+    let mut r = Rewards {
+        version: 1,
+        launch: Pubkey::new_unique(),
+        available: 0,
+        credited: 0,
+        paid: 0,
+        quote_spent: 0,
+        round: 0,
+        remaining: 0,
+        deadline: 0,
+        leaves: 0,
+        root: [0; 32],
+        bitmap: [0; 128],
+    };
+    assert_eq!(borsh::to_vec(&r).unwrap().len(), REWARDS_LEN);
+    r.credit(123_456_789, 750_000_000).unwrap();
+    assert_eq!(r.available, 123_456_789);
+    assert_eq!(r.quote_spent, 750_000_000);
+    r.open_round([1; 32], 123_456_789, 2, 4600, 1000).unwrap();
+    r.mark_paid(0, 1_000_000, 1000).unwrap();
+    assert!(r.mark_paid(0, 1_000_000, 1000).is_err());
+    r.close_round(4600).unwrap();
+    assert_eq!(r.available, 122_456_789);
+    assert_eq!(r.available + r.paid, r.credited);
+}

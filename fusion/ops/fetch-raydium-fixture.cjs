@@ -6,6 +6,7 @@ const fs = require("node:fs"),
 const { Connection, PublicKey } = require("@solana/web3.js");
 const sdk = require("@raydium-io/raydium-sdk-v2"),
   spl = require("@solana/spl-token");
+const { MOONZ, OG, USDC, market } = require("../client/rewards.cjs");
 const { LAUNCHLAB, CPMM, LOADER } = require("../client/index.cjs");
 async function main() {
   const connection = new Connection(
@@ -29,6 +30,17 @@ async function main() {
     sdk.getPdaPlatformCurveRule(LAUNCHLAB, keys[0], global).publicKey,
   );
   keys.push(sdk.CREATE_CPMM_POOL_FEE_ACC);
+  // The canonical MOONZ market may be on its bonding curve or either OG AMM quote.
+  const ogState = PublicKey.findProgramAddressSync([Buffer.from("launch_state"), MOONZ.toBuffer()], OG)[0];
+  const og = await connection.getAccountInfo(ogState);
+  if (!og?.owner.equals(OG) || og.data.length !== 386) throw Error("Unexpected MOONZ market");
+  const creator = new PublicKey(og.data.subarray(47, 79));
+  keys.push(MOONZ, USDC, ogState);
+  for (const quote of [spl.NATIVE_MINT, USDC]) {
+    const m = market(creator, quote);
+    for (const name of ["saleVault", "lpVault", "treasury", "creatorAuthority", "creatorFeeVault", "platformFeeVault"])
+      if (!keys.some(k => k.equals(m[name]))) keys.push(m[name]);
+  }
   const result = await connection.getMultipleAccountsInfoAndContext(keys);
   const accounts = result.value
     .map((a, i) =>
@@ -50,6 +62,7 @@ async function main() {
   for (const [name, id] of [
     ["launchlab", LAUNCHLAB],
     ["cpmm", CPMM],
+    ["moonz-og", OG],
   ]) {
     const program = await connection.getAccountInfo(id);
     if (!program?.owner.equals(LOADER) || program.data.readUInt32LE(0) !== 2)
@@ -58,6 +71,7 @@ async function main() {
       a = await connection.getAccountInfo(programData);
     if (!a?.owner.equals(LOADER) || a.data.readUInt32LE(0) !== 3)
       throw new Error("Unexpected program data");
+    if (name === "moonz-og" && a.data[12] !== 0) throw Error("OG program must remain immutable");
     fs.writeFileSync(path.join(out, name + ".so"), a.data.subarray(45));
     console.log(name, id.toBase58(), a.data.length - 45, "bytes");
   }

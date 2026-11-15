@@ -1,11 +1,11 @@
-use crate::{raydium, state::*, token};
+use crate::{raydium, rewards, state::*, token};
 use borsh::BorshDeserialize;
 use solana_program::{
     account_info::AccountInfo, bpf_loader_upgradeable, clock::Clock, program::invoke_signed,
     program_error::ProgramError, pubkey::Pubkey, sysvar::Sysvar,
 };
 
-fn config(program: &Pubkey, a: &AccountInfo) -> Result<Config> {
+pub(crate) fn config(program: &Pubkey, a: &AccountInfo) -> Result<Config> {
     require(
         *a.key == Pubkey::find_program_address(&[CONFIG_SEED], program).0,
         Error::InvalidAccount,
@@ -14,10 +14,10 @@ fn config(program: &Pubkey, a: &AccountInfo) -> Result<Config> {
     require(cfg.version == VERSION, Error::InvalidState)?;
     Ok(cfg)
 }
-fn launch(program: &Pubkey, a: &AccountInfo) -> Result<Launch> {
+pub(crate) fn launch(program: &Pubkey, a: &AccountInfo) -> Result<Launch> {
     let s: Launch = read(a, program, LAUNCH_LEN)?;
     require(
-        s.version == VERSION
+        (s.version == VERSION || s.version == MOONZ_LAUNCH_VERSION)
             && *a.key == Pubkey::find_program_address(&[LAUNCH_SEED, s.base.as_ref()], program).0,
         Error::InvalidAccount,
     )?;
@@ -26,17 +26,17 @@ fn launch(program: &Pubkey, a: &AccountInfo) -> Result<Launch> {
 fn signer(a: &AccountInfo, key: &Pubkey) -> Result<()> {
     require(a.is_signer && a.key == key, Error::Unauthorized)
 }
-fn now() -> Result<u64> {
+pub(crate) fn now() -> Result<u64> {
     Clock::get()?
         .unix_timestamp
         .try_into()
         .map_err(|_| Error::Expired.into())
 }
-fn operator(a: &AccountInfo, cfg: &Config) -> Result<()> {
+pub(crate) fn operator(a: &AccountInfo, cfg: &Config) -> Result<()> {
     signer(a, &cfg.operator)?;
     require(!cfg.paused, Error::Paused)
 }
-fn count(a: &[AccountInfo], n: usize) -> Result<()> {
+pub(crate) fn count(a: &[AccountInfo], n: usize) -> Result<()> {
     require(a.len() == n, Error::InvalidAccount)
 }
 
@@ -46,6 +46,35 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
     let ix = FusionInstruction::try_from_slice(data)
         .map_err(|_| ProgramError::InvalidInstructionData)?;
     match ix {
+        FusionInstruction::InitializeRewards => rewards::initialize(program, a),
+        FusionInstruction::BuyMoonz {
+            amount,
+            min_bridge_out,
+            min_moonz_out,
+            deadline,
+            bridge_data,
+        } => rewards::buy(
+            program,
+            a,
+            amount,
+            min_bridge_out,
+            min_moonz_out,
+            deadline,
+            &bridge_data,
+        ),
+        FusionInstruction::OpenMoonzRound {
+            root,
+            total,
+            leaves,
+            deadline,
+        } => rewards::open(program, a, root, total, leaves, deadline),
+        FusionInstruction::PayMoonz {
+            round,
+            index,
+            amount,
+            proof,
+        } => rewards::pay(program, a, round, index, amount, &proof),
+        FusionInstruction::CloseMoonzRound => rewards::close(program, a),
         FusionInstruction::Initialize {
             operator,
             fee_wallet,
@@ -166,7 +195,7 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
             write(
                 &a[2],
                 &Launch {
-                    version: VERSION,
+                    version: MOONZ_LAUNCH_VERSION,
                     base: *base,
                     quote: *quote,
                     quote_program: *r[11].key,
@@ -280,6 +309,7 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
             let cfg = config(program, &a[1])?;
             operator(&a[0], &cfg)?;
             let mut s = launch(program, &a[2])?;
+            require(s.version == VERSION, Error::InvalidState)?;
             s.open_round(root, total, leaves, deadline, now()?)?;
             write(&a[2], &s)
         }
@@ -293,6 +323,7 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
             let cfg = config(program, &a[1])?;
             require(!cfg.paused, Error::Paused)?;
             let mut s = launch(program, &a[2])?;
+            require(s.version == VERSION, Error::InvalidState)?;
             require(s.round == round, Error::InvalidProof)?;
             verify_proof(
                 leaf(program, a[2].key, round, index, a[5].key, amount),
@@ -312,6 +343,7 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
         FusionInstruction::CloseRound => {
             count(a, 1)?;
             let mut s = launch(program, &a[0])?;
+            require(s.version == VERSION, Error::InvalidState)?;
             s.close_round(now()?)?;
             write(&a[0], &s)
         }
