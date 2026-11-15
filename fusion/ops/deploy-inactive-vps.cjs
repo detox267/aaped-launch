@@ -2,7 +2,7 @@
 "use strict";
 // Deliberately pins the already-tested program release, independently of this
 // operational helper's commit. Initialization is explicit and always paused.
-// No activation, authority transfer, swaps, payouts or wallet funding.
+// No activation, changes to loader authority, swaps, payouts or wallet funding.
 const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
 const { createRequire } = require("node:module");
 const { spawn, execFileSync } = require("node:child_process");
@@ -40,6 +40,9 @@ const INITIALIZE = Object.freeze({
   microLamportsPerCu: 50000, maxCostLamports: 10000000,
   record: "initialize-paused-attempt.json",
 });
+const TAX_REGISTRATION = Object.freeze({ record: "register-tax-authority-attempt.json",
+  receipt: "register-tax-authority-receipt.json", poolBytes: 429, platformOffset: 173,
+  computeUnits: 100000, microLamportsPerCu: 50000, maxFeeLamports: 100000 });
 const OWN_ERROR = Symbol("publicError");
 function need(ok, code) {
   if (!ok) { const e = new Error(code); e[OWN_ERROR] = code; throw e; }
@@ -459,14 +462,194 @@ async function initializePausedConfig({ rpc, cfg, privateDir, binary, adminFile,
     note: "Keep the original initialization attempt record. Do not create another transaction." }, null, 2));
   process.exitCode = 1;
 }
+function taxAuthorityInstruction(web3, platformData) {
+  const { PublicKey, TransactionInstruction } = web3, d = Buffer.from(platformData);
+  need(d.length === 944 && d.subarray(0, 8).equals(crypto.createHash("sha256").update("account:PlatformConfig").digest().subarray(0, 8)),
+    "tax_registration_platform_layout_mismatch");
+  const tax = PublicKey.findProgramAddressSync([Buffer.from("tax-authority")], new PublicKey(PINS.program))[0];
+  function string(offset, length) {
+    const bytes = d.subarray(offset, offset + length), zero = bytes.indexOf(0), end = zero < 0 ? bytes.length : zero;
+    need(bytes.subarray(end).every(byte => byte === 0), "tax_registration_noncanonical_branding");
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, end));
+    const encoded = Buffer.from(text), size = Buffer.alloc(4); size.writeUInt32LE(encoded.length);
+    need(encoded.equals(bytes.subarray(0, end)), "tax_registration_invalid_branding");
+    return Buffer.concat([size, encoded]);
+  }
+  // Raydium SDK 0.2.74-alpha exposes this authority through UpdatePlatformConfig
+  // AllInfo (8). Carry every serialized field forward byte-for-byte. Simulation
+  // and final receipt checks reject any account change except authority + epoch.
+  return new TransactionInstruction({ programId: new PublicKey(INITIALIZE.launchlab), keys: [
+    { pubkey: new PublicKey(PINS.admin), isSigner: true, isWritable: false },
+    { pubkey: new PublicKey(INITIALIZE.platform), isSigner: false, isWritable: true },
+    { pubkey: new PublicKey(INITIALIZE.cpConfig), isSigner: false, isWritable: false },
+  ], data: Buffer.concat([Buffer.from([195, 60, 76, 129, 146, 45, 67, 143, 8]),
+    d.subarray(16, 112), string(112, 64), string(176, 256), string(432, 256), tax.toBuffer(),
+    d.subarray(720, 728), d.subarray(792, 800), d.subarray(760, 792)]) });
+}
+function checkTaxAuthorityChange(before, after, PublicKey) {
+  const d = before.data, next = after?.data;
+  need(before.owner.equals(new PublicKey(INITIALIZE.launchlab)) && !before.executable
+    && after && after.owner.equals(before.owner) && !after.executable && after.lamports === before.lamports
+    && d.length === 944 && next.length === 944, "tax_registration_account_changed");
+  const tax = PublicKey.findProgramAddressSync([Buffer.from("tax-authority")], new PublicKey(PINS.program))[0];
+  need(new PublicKey(d.subarray(728, 760)).toBase58() === PINS.operator
+    && new PublicKey(next.subarray(728, 760)).equals(tax)
+    && next.readBigUInt64LE(8) > d.readBigUInt64LE(8), "tax_registration_authority_or_epoch_mismatch");
+  for (let i = 0; i < 944; i++) {
+    if ((i >= 8 && i < 16) || (i >= 728 && i < 760)) continue;
+    need(next[i] === d[i], "tax_registration_changed_unrelated_setting");
+  }
+  return { previousTaxAuthority: PINS.operator, platformTaxAuthority: tax.toBase58(),
+    platformTaxAuthorityReady: true, platformEpoch: next.readBigUInt64LE(8).toString(),
+    otherPlatformSettingsUnchanged: true };
+}
+async function requireEmptyPlatform(rpc, PublicKey, minContextSlot) {
+  for (const commitment of ["finalized", "confirmed"]) {
+    const result = await rpc.getProgramAccounts(new PublicKey(INITIALIZE.launchlab), {
+      commitment, withContext: true, minContextSlot, dataSlice: { offset: 0, length: 0 },
+      filters: [{ dataSize: TAX_REGISTRATION.poolBytes },
+        { memcmp: { offset: TAX_REGISTRATION.platformOffset, bytes: INITIALIZE.platform } }],
+    });
+    need(result?.context?.slot >= minContextSlot && Array.isArray(result.value), "tax_registration_pool_scan_invalid");
+    need(result.value.length === 0, "existing_platform_launches_require_authority_review");
+  }
+}
+function checkTaxBackend(fromApi, cfg, apiDir) {
+  const fileEnv = fromApi("dotenv").parse(fs.readFileSync(path.join(apiDir, ".env"), "utf8"));
+  const { effectiveEnv } = fromApi("./launchlab/ops/check-readiness.cjs"), { readConfig } = fromApi("./launchlab/config");
+  const apps = JSON.parse(execFileSync("pm2", ["jlist"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] }));
+  for (const name of ["aaped-api", "moonz-fusion-live"]) {
+    const app = apps.find(item => item.name === name);
+    need(app?.pm2_env?.pm_cwd === apiDir, "tax_registration_backend_process_mismatch");
+    const current = readConfig(effectiveEnv(fileEnv, app));
+    need(!current.requestedEnabled && !current.rewards.enabled && !current.rewards.live
+      && current.rpcUrl === cfg.rpcUrl && current.cluster === "mainnet-beta"
+      && current.admin?.toBase58() === PINS.admin, "tax_registration_backend_must_remain_disabled");
+  }
+  const Database = fromApi("better-sqlite3"), db = new Database(cfg.dbPath, { readonly: true, fileMustExist: true });
+  try { need(db.prepare("SELECT count(*) AS n FROM ll_tokens").get().n === 0, "registered_backend_tokens_require_authority_review"); }
+  finally { db.close(); }
+}
+async function registerTaxAuthority({ rpc, cfg, privateDir, binary, adminFile, web3, checkBackend }) {
+  const { PublicKey, Keypair, TransactionMessage, VersionedTransaction, ComputeBudgetProgram } = web3;
+  const a = derive(PublicKey), [metadataPda] = verificationAddress(PublicKey);
+  const recordFile = path.join(privateDir, TAX_REGISTRATION.record), receiptFile = path.join(privateDir, TAX_REGISTRATION.receipt);
+  stage = "tax_registration_preflight";
+  need(cfg.feeWallet?.toBase58() === INITIALIZE.feeWallet && cfg.platformId?.toBase58() === INITIALIZE.platform
+    && cfg.cpConfigId?.toBase58() === INITIALIZE.cpConfig, "tax_registration_backend_bindings_mismatch");
+  const platformPda = PublicKey.findProgramAddressSync([Buffer.from("platform_config"), new PublicKey(PINS.admin).toBuffer()], new PublicKey(INITIALIZE.launchlab))[0];
+  need(platformPda.toBase58() === INITIALIZE.platform, "tax_registration_platform_admin_mismatch");
+  async function state() {
+    const result = await rpc.getMultipleAccountsInfoAndContext([a.program, a.programData, a.config, metadataPda,
+      platformPda, new PublicKey(INITIALIZE.cpConfig)], "finalized");
+    const chain = checkDeployed({ program: result.value[0], programData: result.value[1], binary, PublicKey });
+    checkVerificationMetadata({ account: result.value[3], PublicKey, deploymentSlot: chain.deploymentSlot });
+    return { chain, configuration: checkInitializedConfig(result.value[2], PublicKey), configAccount: result.value[2],
+      platform: checkInitializationPlatform(result.value[4], result.value[5], PublicKey),
+      platformAccount: result.value[4], cpConfig: result.value[5], finalizedSlot: result.context.slot };
+  }
+  need(publicVerificationMatches(await publicVerificationStatus(), binary), "tax_registration_requires_public_verification");
+  checkBackend();
+  let current = await state();
+  function existing() {
+    if (!current.platform.platformTaxAuthorityReady) return false;
+    console.log(JSON.stringify({ readOnly: true, transactionsSent: 0, status: "tax_authority_already_registered",
+      ...current.chain, configuration: current.configuration, ...current.platform, configInitialized: true,
+      publicSourceVerificationConfirmed: true, finalizedSlot: current.finalizedSlot, activationAllowed: false }, null, 2));
+    return true;
+  }
+  if (existing()) return;
+  need(!fs.existsSync(recordFile) && !fs.existsSync(receiptFile), "previous_tax_registration_requires_reconciliation");
+  await requireEmptyPlatform(rpc, PublicKey, current.finalizedSlot);
+  const before = current.platformAccount, originalConfig = Buffer.from(current.configAccount.data);
+  const epoch = await rpc.getEpochInfo("finalized");
+  need(Number.isSafeInteger(epoch.epoch) && BigInt(epoch.epoch) > before.data.readBigUInt64LE(8), "tax_registration_wait_for_next_epoch");
+  stage = "tax_registration_transaction_preparation";
+  const [latest, balance] = await Promise.all([rpc.getLatestBlockhash("finalized"), rpc.getBalance(new PublicKey(PINS.admin), "finalized")]);
+  const message = new TransactionMessage({ payerKey: new PublicKey(PINS.admin), recentBlockhash: latest.blockhash,
+    instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: TAX_REGISTRATION.computeUnits }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: TAX_REGISTRATION.microLamportsPerCu }),
+      taxAuthorityInstruction(web3, before.data)] }).compileToV0Message();
+  const fee = (await rpc.getFeeForMessage(message, "finalized")).value;
+  need(Number.isSafeInteger(fee) && fee > 0 && fee <= TAX_REGISTRATION.maxFeeLamports
+    && Number.isSafeInteger(balance) && balance >= fee + PINS.reserveLamports, "tax_registration_fee_or_reserve_limit");
+  const tx = new VersionedTransaction(message);
+  privatePath(adminFile);
+  let bytes, signer;
+  try {
+    const values = JSON.parse(fs.readFileSync(adminFile, "utf8"));
+    need(Array.isArray(values) && values.length === 64 && values.every(n => Number.isInteger(n) && n >= 0 && n <= 255), "invalid_signer_file");
+    bytes = Uint8Array.from(values); values.fill(0); signer = Keypair.fromSecretKey(bytes);
+    need(signer.publicKey.toBase58() === PINS.admin, "signer_identity_mismatch"); tx.sign([signer]);
+  } finally { bytes?.fill(0); signer?.secretKey.fill(0); }
+  stage = "tax_registration_simulation";
+  const simulation = await rpc.simulateTransaction(tx, { sigVerify: true, commitment: "finalized", accounts: {
+    encoding: "base64", addresses: [platformPda.toBase58(), a.config.toBase58()] } });
+  need(!simulation.value.err && simulation.value.accounts?.length === 2, "tax_registration_simulation_failed");
+  const simulated = simulation.value.accounts.map(account => {
+    need(account && Array.isArray(account.data) && account.data[1] === "base64", "tax_registration_simulation_accounts_missing");
+    return { ...account, owner: new PublicKey(account.owner), data: Buffer.from(account.data[0], "base64") };
+  });
+  checkTaxAuthorityChange(before, simulated[0], PublicKey);
+  checkInitializationPlatform(simulated[0], current.cpConfig, PublicKey);
+  checkInitializedConfig(simulated[1], PublicKey);
+  need(simulated[1].data.equals(originalConfig), "tax_registration_changed_fusion_config");
+  stage = "tax_registration_final_preflight";
+  need(publicVerificationMatches(await publicVerificationStatus(), binary), "tax_registration_requires_public_verification");
+  checkBackend(); current = await state();
+  if (existing()) return;
+  need(current.platformAccount.data.equals(before.data) && current.platformAccount.lamports === before.lamports
+    && current.configAccount.data.equals(originalConfig), "tax_registration_state_changed_before_send");
+  await requireEmptyPlatform(rpc, PublicKey, current.finalizedSlot);
+  need(await rpc.getBlockHeight("finalized") + 10 < latest.lastValidBlockHeight, "tax_registration_blockhash_too_old");
+  const raw = Buffer.from(tx.serialize()), signature = signatureBase58(tx.signatures[0]);
+  console.log(JSON.stringify({ status: "tax_registration_preflight_passed", ...current.chain, configuration: current.configuration,
+    ...current.platform, platformLaunches: 0, estimatedTransactionFeeSol: fee / 1e9,
+    maximumTransactionFeeSol: TAX_REGISTRATION.maxFeeLamports / 1e9,
+    otherPlatformSettingsPreservedInSimulation: true, rpcProvider: providerLabel, activationAllowed: false }, null, 2));
+  stage = "tax_registration_journal";
+  writeNew(recordFile, JSON.stringify({ ...current.chain, signature, platform: INITIALIZE.platform,
+    previousPlatformDataBase64: before.data.toString("base64"), previousPlatformLamports: before.lamports,
+    blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight,
+    transactionSha256: crypto.createHash("sha256").update(raw).digest("hex"), signedTransactionBase64: raw.toString("base64"),
+    startedAt: new Date().toISOString(), activationAllowed: false }, null, 2));
+  pendingTransactionSignature = signature;
+  stage = "tax_registration_submission";
+  let sendAcknowledged = false;
+  try { sendAcknowledged = await rpc.sendRawTransaction(raw, { skipPreflight: false, preflightCommitment: "finalized", maxRetries: 3 }) === signature; }
+  catch { /* Reconcile the one journaled signature even if the provider returned an error. */ }
+  stage = "tax_registration_reconciliation";
+  for (let i = 0; i < 24; i++) {
+    let status = null;
+    try { status = (await rpc.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0]; }
+    catch { /* Keep the original signed attempt on ambiguous reads. */ }
+    if (status?.confirmationStatus === "finalized") {
+      need(!status.err, "tax_registration_transaction_failed"); current = await state();
+      const change = checkTaxAuthorityChange(before, current.platformAccount, PublicKey);
+      need(current.configAccount.data.equals(originalConfig), "tax_registration_changed_fusion_config");
+      await requireEmptyPlatform(rpc, PublicKey, current.finalizedSlot);
+      const report = { status: "tax_authority_registered_paused", signature, transactionsSent: 1, ...current.chain,
+        configuration: current.configuration, ...change, configInitialized: true, publicSourceVerificationConfirmed: true,
+        rpcProvider: providerLabel, finalizedSlot: current.finalizedSlot, activationAllowed: false };
+      writeNew(receiptFile, JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2)); return;
+    }
+    if (i % 6 === 0) console.log("Waiting for the tax-authority registration to finalize. Fusion remains paused.");
+    if (i < 23) await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+  console.log(JSON.stringify({ status: "tax_registration_needs_reconciliation", signature, sendAcknowledged,
+    transactionsMayHaveBeenSent: true, activationAllowed: false,
+    note: "Keep the original tax-registration attempt record. Do not create another transaction." }, null, 2));
+  process.exitCode = 1;
+}
 let stage = "arguments", providerLabel = null, pendingTransactionSignature = null;
 async function main(argv = process.argv.slice(2)) {
   const resume = argv[0] === "--resume";
   const verify = argv[0] === "--verify";
   const initializePaused = argv[0] === "--initialize-paused";
-  const live = argv[0] === "--deploy" || resume || verify || initializePaused;
+  const registerTax = argv[0] === "--register-tax-authority";
+  const live = argv[0] === "--deploy" || resume || verify || initializePaused || registerTax;
   const buildDir = live ? argv[1] : argv[0];
-  need(argv.length === (live ? 2 : 1) && typeof buildDir === "string" && path.isAbsolute(buildDir), "usage_node_helper_optional_deploy_resume_verify_or_initialize_paused_absolute_fusion_directory");
+  need(argv.length === (live ? 2 : 1) && typeof buildDir === "string" && path.isAbsolute(buildDir), "usage_node_helper_optional_deploy_resume_verify_initialize_paused_or_register_tax_authority_absolute_fusion_directory");
   need(process.getuid() === 0, "run_on_vps_as_root");
   const apiDir = "/root/aaped-api", privateDir = "/root/.config/moonz-fusion";
   const programFile = path.join(privateDir, "program-id.json"), bufferFile = path.join(privateDir, "deployment-buffer.json");
@@ -507,13 +690,15 @@ async function main(argv = process.argv.slice(2)) {
   const [oldProgram, oldData, oldConfig, oldBuffer, adminAccount] = before.value;
   if (oldProgram) {
     const result = checkDeployed({ program: oldProgram, programData: oldData, binary, PublicKey });
+    if (registerTax) { await registerTaxAuthority({ rpc, cfg, privateDir, binary, adminFile, web3: fromApi("@solana/web3.js"),
+      checkBackend: () => checkTaxBackend(fromApi, cfg, apiDir) }); return; }
     if (initializePaused) { await initializePausedConfig({ rpc, cfg, privateDir, binary, adminFile, web3: fromApi("@solana/web3.js") }); return; }
     if (verify) { await verifyPublicSource({ rpc, cfg, privateDir, binary, adminFile, PublicKey }); return; }
     console.log(JSON.stringify({ readOnly: true, transactionsSent: 0, status: "already_deployed_matches_release", ...result,
       configPresent: !!oldConfig, publicSourceVerificationConfirmed: false, activationAllowed: false }, null, 2));
     return;
   }
-  need(!verify && !initializePaused, "program_not_deployed");
+  need(!verify && !initializePaused && !registerTax, "program_not_deployed");
   need(!oldData && !oldConfig, "existing_accounts_require_deployment_recovery_review");
   let recovery = null;
   const recordFile = resume ? path.join(privateDir, RESUME.record) : attemptFile;
@@ -608,4 +793,5 @@ if (require.main === module) main().catch(e => {
 module.exports = { PINS, RESUME, VERIFY, checkBinary, checkDeployed, checkResume, activeBufferDeployment, rpcProvider,
   budget, deploymentArgs, readSigner, safeError, runCli, writeNew, verificationArgs, verificationAddress,
   checkVerificationMetadata, normalizedHash, publicVerificationMatches, INITIALIZE, initializeInstruction,
-  checkInitializedConfig, checkInitializationPlatform, initializationBudget, signatureBase58, initializePausedConfig };
+  checkInitializedConfig, checkInitializationPlatform, initializationBudget, signatureBase58, initializePausedConfig,
+  TAX_REGISTRATION, taxAuthorityInstruction, checkTaxAuthorityChange, requireEmptyPlatform, checkTaxBackend, registerTaxAuthority };
