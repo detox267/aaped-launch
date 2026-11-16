@@ -10,7 +10,7 @@ use solana_program::{
     pubkey::{pubkey, Pubkey},
 };
 pub const MOONZ: Pubkey = pubkey!("DfUWVvq1NDip9EQT9RreVDTQL3kArLJkwq7e9LXZEfkh");
-fn mint(a: &AccountInfo) -> Result<()> {
+pub(crate) fn mint(a: &AccountInfo) -> Result<()> {
     require(
         *a.key == MOONZ && *a.owner == token::TOKEN,
         Error::InvalidMint,

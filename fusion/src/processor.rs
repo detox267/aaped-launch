@@ -1,4 +1,4 @@
-use crate::{raydium, rewards, state::*, token};
+use crate::{policy, raydium, rewards, state::*, token};
 use borsh::BorshDeserialize;
 use solana_program::{
     account_info::AccountInfo, bpf_loader_upgradeable, clock::Clock, program::invoke_signed,
@@ -46,6 +46,21 @@ pub fn process_instruction(program: &Pubkey, a: &[AccountInfo], data: &[u8]) -> 
     let ix = FusionInstruction::try_from_slice(data)
         .map_err(|_| ProgramError::InvalidInstructionData)?;
     match ix {
+        FusionInstruction::ReleaseCreatorPrize { amount } => policy::release(program, a, amount),
+        FusionInstruction::InitializePolicy => policy::initialize(program, a),
+        FusionInstruction::Buyback {
+            route,
+            amount,
+            min_out,
+            deadline,
+        } => policy::buyback(program, a, route, amount, min_out, deadline),
+        FusionInstruction::BurnBuyback { amount } => policy::burn(program, a, amount),
+        FusionInstruction::ReserveCreatorPrize { amount } => policy::reserve(program, a, amount),
+        FusionInstruction::PayCreatorPrizeMoonz {
+            amount,
+            min_moonz_out,
+            deadline,
+        } => policy::prize(program, a, amount, min_moonz_out, deadline),
         FusionInstruction::InitializeRewards => rewards::initialize(program, a),
         FusionInstruction::BuyMoonz {
             amount,

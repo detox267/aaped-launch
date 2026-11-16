@@ -21,16 +21,26 @@ function privateFile(filename) {
     "Private file must be a regular owner-only file owned by this user");
   return fs.readFileSync(filename, "utf8");
 }
+const signerSecrets = new WeakMap();
 function loadSigner(filename, expected) {
-  let bytes, key;
+  let bytes, owned, key, values;
   try {
-    const values = JSON.parse(privateFile(filename));
+    values = JSON.parse(privateFile(filename));
     need(Array.isArray(values) && values.length === 64 && values.every(n => Number.isInteger(n) && n >= 0 && n <= 255), "Invalid key file");
-    bytes = Uint8Array.from(values); values.fill(0); key = Keypair.fromSecretKey(bytes);
+    bytes = Uint8Array.from(values);
+    // web3.js retains the supplied array. Keep the signer's owned buffer
+    // separate from the temporary input that is cleared before returning.
+    owned = Uint8Array.from(bytes); key = Keypair.fromSecretKey(owned);
     need(key.publicKey.equals(pk(expected)), "Signing key does not match the configured operator");
+    signerSecrets.set(key, owned);
     return key;
-  } catch { key?.secretKey.fill(0); throw new Error("Signer identity or file permissions failed verification"); }
-  finally { bytes?.fill(0); }
+  } catch { owned?.fill(0); throw new Error("Signer identity or file permissions failed verification"); }
+  finally { if (Array.isArray(values)) values.fill(0); bytes?.fill(0); }
+}
+function destroySigner(key) {
+  // secretKey is a defensive copy in web3.js; clearing that getter is not cleanup.
+  const owned = signerSecrets.get(key);
+  if (owned) { owned.fill(0); signerSecrets.delete(key); }
 }
 // Never persist RPC URLs/provider error payloads, which may contain credentials.
 function safeRpc(connection) {
@@ -47,4 +57,4 @@ function layoutAccount(info, owner, layout, name) {
   `Invalid ${name} account`);
   return layout.decode(info.data);
 }
-module.exports = { need, digest, pk, raw, encodeInstruction, decodeInstruction, privateFile, loadSigner, safeRpc, layoutAccount };
+module.exports = { need, digest, pk, raw, encodeInstruction, decodeInstruction, privateFile, loadSigner, destroySigner, safeRpc, layoutAccount };

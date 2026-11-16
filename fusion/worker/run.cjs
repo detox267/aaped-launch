@@ -3,7 +3,7 @@
 const fs = require("node:fs"), path = require("node:path");
 const { Collector, CollectorStore } = require("./collector.cjs");
 const { RpcAdapter } = require("./rpc-adapter.cjs");
-const { need, pk, raw, privateFile, loadSigner } = require("./common.cjs");
+const { need, pk, raw, privateFile, loadSigner, destroySigner } = require("./common.cjs");
 
 function configFile(filename) {
   const cfg = JSON.parse(privateFile(filename));
@@ -72,7 +72,7 @@ async function main() {
       if (!stopping) await new Promise(resolve => setTimeout(resolve, 1000));
     }
   } finally {
-    store.close(); signer.secretKey.fill(0);
+    store.close(); destroySigner(signer);
   }
 }
 function privateFileSizeCheck(filename) {

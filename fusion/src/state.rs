@@ -7,6 +7,8 @@ pub const VERSION: u8 = 1;
 pub const MOONZ_LAUNCH_VERSION: u8 = 2;
 pub const REWARDS_SEED: &[u8] = b"rewards";
 pub const REWARDS_LEN: usize = 1 + 32 + 8 * 8 + 32 + 128;
+pub const POLICY_SEED: &[u8] = b"policy";
+pub const POLICY_LEN: usize = 1 + 32 + 8 * 10;
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const AUTH_SEED: &[u8] = b"tax-authority";
 pub const LAUNCH_SEED: &[u8] = b"launch";
@@ -95,6 +97,23 @@ pub struct Launch {
     pub leaves: u64,
     pub root: [u8; 32],
     pub bitmap: [u8; 128],
+}
+// Separate vaults keep missed-target purchases out of the tax collector and
+// reserved creator prizes out of ordinary platform withdrawals/gas funding.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
+pub struct Policy {
+    pub version: u8,
+    pub launch: Pubkey,
+    pub base_pending: u64,
+    pub base_bought: u64,
+    pub base_burned: u64,
+    pub holder_quote_spent: u64,
+    pub prize_quote_available: u64,
+    pub prize_quote_reserved: u64,
+    pub prize_quote_spent: u64,
+    pub prize_moonz_paid: u64,
+    pub sequence: u64,
+    pub prize_quote_released: u64,
 }
 impl Launch {
     pub fn obligations(&self) -> Result<u64> {
@@ -235,6 +254,27 @@ pub enum FusionInstruction {
     },
     CloseMoonzRound,
     FundDistributionFees {
+        amount: u64,
+    },
+    InitializePolicy,
+    Buyback {
+        route: u8,
+        amount: u64,
+        min_out: u64,
+        deadline: u64,
+    },
+    BurnBuyback {
+        amount: u64,
+    },
+    ReserveCreatorPrize {
+        amount: u64,
+    },
+    PayCreatorPrizeMoonz {
+        amount: u64,
+        min_moonz_out: u64,
+        deadline: u64,
+    },
+    ReleaseCreatorPrize {
         amount: u64,
     },
 }

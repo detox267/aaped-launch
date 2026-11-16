@@ -177,6 +177,59 @@ pub fn convert<'a>(
     amount: u64,
     min_out: u64,
 ) -> Result<()> {
+    let bump = Pubkey::find_program_address(&[LAUNCH_SEED, state.base.as_ref()], program).1;
+    swap(
+        program,
+        launch,
+        a,
+        cfg,
+        state,
+        route,
+        amount,
+        min_out,
+        false,
+        &[LAUNCH_SEED, state.base.as_ref(), &[bump]],
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub fn buyback<'a>(
+    program: &Pubkey,
+    launch: &AccountInfo<'a>,
+    policy: &AccountInfo<'a>,
+    a: &[AccountInfo<'a>],
+    cfg: &Config,
+    state: &Launch,
+    route: u8,
+    amount: u64,
+    min_out: u64,
+) -> Result<()> {
+    let bump = Pubkey::find_program_address(&[POLICY_SEED, launch.key.as_ref()], program).1;
+    swap(
+        program,
+        policy,
+        a,
+        cfg,
+        state,
+        route,
+        amount,
+        min_out,
+        true,
+        &[POLICY_SEED, launch.key.as_ref(), &[bump]],
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn swap<'a>(
+    program: &Pubkey,
+    launch: &AccountInfo<'a>,
+    a: &[AccountInfo<'a>],
+    cfg: &Config,
+    state: &Launch,
+    route: u8,
+    amount: u64,
+    min_out: u64,
+    buy_base: bool,
+    seeds: &[&[u8]],
+) -> Result<()> {
     let (id, writable, data): (Pubkey, Vec<usize>, Vec<u8>) = match route {
         0 => {
             require(a.len() == 18, Error::InvalidRoute)?;
@@ -222,7 +275,11 @@ pub fn convert<'a>(
             )?;
             // Recheck platform fees at conversion too; a changed platform cannot silently add Moonz fees.
             platform(&a[3], cfg, &pda(&[AUTH_SEED], program))?;
-            let mut d = vec![149, 39, 222, 155, 211, 124, 152, 26];
+            let mut d = if buy_base {
+                vec![250, 234, 13, 123, 213, 156, 19, 236]
+            } else {
+                vec![149, 39, 222, 155, 211, 124, 152, 26]
+            };
             d.extend(amount.to_le_bytes());
             d.extend(min_out.to_le_bytes());
             d.extend(0u64.to_le_bytes());
@@ -247,23 +304,25 @@ pub fn convert<'a>(
                 *a[3].owner == CPMM && *a[2].owner == CPMM,
                 Error::InvalidRoute,
             )?;
-            key(&a[4], token::ata(&state.base, launch.key, &token::TOKEN22))?;
-            key(
-                &a[5],
-                token::ata(&state.quote, launch.key, &state.quote_program),
-            )?;
+            let (input, output, input_program, output_program) = if buy_base {
+                (state.quote, state.base, state.quote_program, token::TOKEN22)
+            } else {
+                (state.base, state.quote, token::TOKEN22, state.quote_program)
+            };
+            key(&a[4], token::ata(&input, launch.key, &input_program))?;
+            key(&a[5], token::ata(&output, launch.key, &output_program))?;
             key(
                 &a[6],
-                pda(&[b"pool_vault", pool.as_ref(), state.base.as_ref()], &CPMM),
+                pda(&[b"pool_vault", pool.as_ref(), input.as_ref()], &CPMM),
             )?;
             key(
                 &a[7],
-                pda(&[b"pool_vault", pool.as_ref(), state.quote.as_ref()], &CPMM),
+                pda(&[b"pool_vault", pool.as_ref(), output.as_ref()], &CPMM),
             )?;
-            key(&a[8], token::TOKEN22)?;
-            key(&a[9], state.quote_program)?;
-            key(&a[10], state.base)?;
-            key(&a[11], state.quote)?;
+            key(&a[8], input_program)?;
+            key(&a[9], output_program)?;
+            key(&a[10], input)?;
+            key(&a[11], output)?;
             key(&a[12], pda(&[b"observation", pool.as_ref()], &CPMM))?;
             key(&a[13], CPMM)?;
             let mut d = vec![143, 190, 90, 218, 196, 30, 51, 222];
@@ -289,7 +348,6 @@ pub fn convert<'a>(
             }
         })
         .collect();
-    let bump = Pubkey::find_program_address(&[LAUNCH_SEED, state.base.as_ref()], program).1;
     invoke_signed(
         &Instruction {
             program_id: id,
@@ -297,6 +355,6 @@ pub fn convert<'a>(
             data,
         },
         a,
-        &[&[LAUNCH_SEED, state.base.as_ref(), &[bump]]],
+        &[seeds],
     )
 }

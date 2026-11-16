@@ -3,14 +3,14 @@
 Report vulnerabilities privately using [GitHub security advisories](https://github.com/detox267/aaped-launch/security/advisories/new).
 Include the source commit, instruction/account inputs, expected behavior and a reproducible local test. Do not include private keys or exploit live funds.
 
-This is a new, un-deployed implementation undergoing review. No independent audit is claimed. The embedded security.txt identifies this policy and the public source repository. Source verification proves a deployed binary matches a public commit; it does not prove correctness.
+This branch is an upgrade candidate for the deployed Fusion program. Its new policy instructions are not active until the candidate is built, deployed and publicly verified. No independent audit is claimed. The embedded security.txt identifies this policy and the public source repository. Source verification proves a deployed binary matches a public commit; it does not prove correctness.
 
 ## Authority and trust boundaries
 
 - The deployment remains upgradeable. The loader upgrade authority can replace program logic. Initialization verifies that authority's signature, and no instruction revokes or changes it. Application admin rotation is a separate two-step process.
 - The admin can pause operations and rotate the operator. The fee recipient, platform and CPMM config are fixed by initialization in v1.
 - The operator chooses swap amounts/minimum output and publishes holder snapshot roots. Holder ownership, USD pricing, the $30 threshold, exclusions and tier timing remain backend responsibilities. A compromised operator can publish a dishonest allocation or bad price; Merkle proofs do **not** establish those external facts. The program enforces the root, budget, recipient, route and replay boundaries.
-- Each token has a separate launch PDA, rewards PDA and canonical vaults. Tax withdrawal uses one program-derived platform authority but always validates the mint and this token's destination vault. There is no general arbitrary CPI or arbitrary admin withdrawal instruction.
+- Each token has a separate launch PDA, rewards PDA, policy PDA and canonical vaults. Tax withdrawal uses one program-derived platform authority but always validates the mint and this token's destination vault. There is no general arbitrary CPI or arbitrary admin withdrawal instruction.
 - Conversion proceeds and explicit quote donations are split cumulatively: 25% platform, 75% holders, with rounding dust assigned to holders. Expired unclaimed amounts return to the same token's net holder budget without another split.
 - Distribution gas may be withdrawn only from a launch's platform budget, in SOL, to the configured operator, within per-transfer and wallet-balance caps. This is an operator-controlled platform operating float, not an on-chain proof of how every funded lamport is subsequently spent. The verified sender reserves and reconciles actual distribution fees, including failed transactions, and cannot substitute holder funds when gas is insufficient. Platform profit accounting must distinguish operating allocations from treasury profit.
 - Payment roots support up to 1,024 unique on-curve recipients and expire after 1 hour–30 days. The backend must persist the complete snapshot/proofs before submission, reconcile finalized chain state, and use sequential rounds for larger snapshots. Missing/frozen/nonstandard recipient accounts fail atomically and can be retried before expiry or rolled into a later round.
@@ -22,3 +22,13 @@ This is a new, un-deployed implementation undergoing review. No independent audi
 - The canary runner requires a verified matching binary, retained expected upgrade authority, current config/operator/fee/platform bindings and operator-funded gas. Its explicit mint list limits this first runner to a small canary. A changed program binary or pause blocks new sends while existing signatures can still be reconciled. Stored signed transactions are sensitive operational state: preserve their SQLite journal and single-process lock, and resolve ambiguous history using archival RPC. Do not share a price API allowance with another process unless its request pacing is coordinated.
 
 The OG immutable Moonz program is outside this implementation. Do not deploy Fusion over its address. Do not use `--final` or set the upgrade authority to `None`.
+
+## Policy extension
+
+The append-only instructions 18–23 initialize policy vaults, buy back the original base token, burn only purchased inventory, reserve a creator prize from the platform pot, pay the original creator in MOONZ, and return unused prize reserves to that same platform pot. Existing Config/Launch/Rewards layouts and instructions 0–17 are unchanged. New policy state is 113 bytes.
+
+A buyback spends only an accounted holder quote budget through the pinned launch's Raydium LaunchLab or migrated CPMM pool. The purchased net Token-2022 balance goes into a separate policy ATA, so the tax collector cannot resell it. Burns debit only the recorded purchased inventory. Prefunded tokens are not implicitly claimed as purchases or prizes. Creator prize reserves cannot be used by ordinary platform withdrawals or gas top-ups; releasing a reserve does not credit holders or apply another split.
+
+The operator remains responsible for authentic closed red/green candle signals, missed deadlines, challenge qualification, prize entitlement and unused-reserve release. The program does not claim to verify those off-chain policies. A malicious operator could initiate a permitted buyback or release a platform prize reserve at the wrong time. The backend journals exact decisions and signatures, while the on-chain constraints bound the permitted routes, assets, recipients and budgets.
+
+Creator prize purchases support MOONZ directly or the current pinned OG market quote. The new instructions neither modify the immutable OG program nor remove Fusion's upgrade authority. The legacy collector-only runner in this public package is not the production combined policy/payout runtime.
