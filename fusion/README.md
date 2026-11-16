@@ -2,7 +2,7 @@
 
 Standalone native Solana program and CommonJS client for per-token launch/reward vaults. The program ID is supplied by the runtime, so the build contains no embedded deployment key. This directory is a separate Cargo workspace; it does not modify the OG program. See [MOONZ reward ABI and integration](MOONZ-REWARDS.md).
 
-**Status: local implementation; not deployed, not publicly verified, not connected to the live backend.** Keep launches/rewards disabled until the release checks below pass. Public source verification and upgradeability are both required.
+**Status: upgrade candidate.** The preceding release at `58ee233a0f5505f7cc62a976dea282c67c553eca` is deployed and publicly verified at `CVzSF4nNHwu12giZUo9WZYGBw5VAbmgFN11ywVXizfmo`, with its configuration paused. This candidate adds the policy vaults in `POLICY.md`; it has not replaced that deployed binary. Keep launches and rewards disabled until the candidate is reproduced, upgraded, publicly verified and exercised by a reconciled live canary.
 
 ## Implemented behavior
 
@@ -43,7 +43,7 @@ The review workflow uses checksum-pinned `solana-verify 0.5.2`, builds in Docker
    ```
    The Docker output is the release artifact. Re-run all SBF tests against it. A locally compiled ELF is a development artifact until reproduced by this workflow.
 2. Run `node ops/budget.cjs target/deploy/moonz_fusion.so` against that artifact. The JSON separates permanent rent from conservative temporary-buffer rent. Optional second argument sets program capacity in bytes. Transaction fees, verification metadata and operator working balance are separate. Create the deployment keypair only on the VPS, outside Git, after the amount and authority are reviewed. Never share it.
-3. Deploy the reviewed Docker artifact to a **new** program address with an explicit retained upgrade authority. Record program ID, deployment transaction, binary hash, capacity, public commit and authority. Do not use the OG address or `--final`. This repository deliberately has no automatic mainnet deployment/activation script.
+3. For the existing Moonz installation, upgrade **the existing Fusion address**, preserving its authority and paused configuration. This candidate is larger than the deployed 243,600-byte capacity: obtain current extension rent and temporary upload-buffer rent before signing. Use a separate durable upgrade journal and resume the same buffer after uncertainty. Do not use the old initial-deployment helper for this upgrade, create a replacement program, use the OG address or pass `--final`.
 4. Verify the deployed artifact against the public commit (the upload requires the upgrade authority):
    ```bash
    solana-verify verify-from-repo -u "$FUSION_RPC_URL" \
@@ -57,7 +57,13 @@ The review workflow uses checksum-pinned `solana-verify 0.5.2`, builds in Docker
    node ops/check-verification.cjs "$FUSION_PROGRAM_ID" \
      "$FUSION_UPGRADE_AUTHORITY" "$FUSION_RELEASE_COMMIT" target/deploy/moonz_fusion.so
    ```
-5. Initialize config **paused** through the retained upgrade authority. Review the exact operator, Moonz fee wallet, platform, CPMM config and maximum swap amount. Verify the platform's tax authority now points to this program's `tax-authority` PDA and the quote allow/curve rules are correct. Existing platform configuration currently points at the old collector wallet; do not change it before program verification.
+5. Preserve the existing paused configuration and registered tax-authority PDA. The SOL permission and fixed 3% curve rule are already configured; validate them without repeating initialization or registration. Before canary execution, review the operational swap cap, platform-funded operator reserve and disabled website launch gates.
 6. Complete the backend adapter/reconciliation review and run a capped canary covering the initial live route; enable migrated CPMM processing only after its separate graduation canary. Enable only after its final receipts, fee split, missing-ATA behavior and restart recovery reconcile. Keep the old worker disabled for PDA tokens. Rebuild and reverify every subsequent program upgrade before resuming activity.
 
 Primary references: [Solana verified builds](https://solana.com/docs/programs/verified-builds), [security.txt format](https://github.com/neodyme-labs/solana-security-txt), Raydium SDK `0.2.74-alpha` (locked).
+
+## Candidate validation boundary
+
+The candidate passes 48 JavaScript tests, 32 LiteSVM execution tests, eight Rust tests and Clippy with warnings denied locally. LiteSVM executes real Raydium, OG and SPL programs but does not spend mainnet funds or reproduce the privileged graduation service. Re-run the SBF tests against the Docker artifact; source-verification metadata for the preceding release does not verify this candidate.
+
+The companion backend owns one shared fee, collection, payout and policy journal. Its launch/reward API gate remains closed until the production installation, public status projection and controlled live canary are complete. A passing local runtime test is not activation evidence.
